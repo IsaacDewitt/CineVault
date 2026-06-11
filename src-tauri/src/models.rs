@@ -61,6 +61,7 @@ pub struct Video {
     pub duration: Option<f64>,
     pub rating: f64,
     pub is_favorite: bool,
+    pub video_type: String,
     pub series_name: Option<String>,
     pub season: Option<i32>,
     pub episode: Option<i32>,
@@ -135,6 +136,17 @@ pub struct ExportData {
 pub struct ImportResult {
     pub imported: i64,
     pub skipped: i64,
+}
+
+/// 剧集概览（用于剧集列表页面）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesOverview {
+    pub name: String,
+    pub total_episodes: i64,
+    pub watched_episodes: i64,
+    pub progress: f64,
+    pub total_size: i64,
+    pub rating: f64,
 }
 
 /// 分页查询结果

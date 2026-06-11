@@ -20,7 +20,7 @@
       <nav class="nav-menu">
         <a href="#" class="nav-item active" data-view="all">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12.5v-9l6 4.5-6 4.5z"/></svg>
-          <span>全部视频</span>
+          <span>电影</span>
           <span class="badge" id="count-all">0</span>
         </a>
         <a href="#" class="nav-item" data-view="favorites">
@@ -100,7 +100,7 @@
 
       <!-- 统计信息条 -->
       <div class="stats-bar" id="stats-bar">
-        <span id="stat-total">0 个视频</span>
+        <span id="stat-total">0 部电影</span>
         <span id="stat-series">0 个剧集</span>
         <span id="stat-size">总大小 0 GB</span>
       </div>
@@ -136,6 +136,10 @@
           <label class="checkbox-label">
             <input type="checkbox" id="incremental-scan" checked />
             <span>增量扫描（跳过已存在的文件）</span>
+          </label>
+          <label class="checkbox-label" style="margin-top:8px;">
+            <input type="checkbox" id="scan-as-series" />
+            <span>扫描为剧集（文件夹名作为剧集名）</span>
           </label>
         </div>
         <div class="scan-progress hidden" id="scan-progress">
@@ -213,6 +217,8 @@
                 <button class="btn btn-secondary" id="btn-open-folder">打开文件夹</button>
                 <button class="btn btn-warning" id="btn-fav-toggle">收藏</button>
                 <button class="btn" id="btn-watched-toggle" style="background:#10b981;color:white;">已看过</button>
+                <button class="btn btn-secondary hidden" id="btn-back-series">返回剧集</button>
+                <button class="btn btn-secondary hidden" id="btn-mark-series-watched">全剧已看过</button>
                 <button class="btn btn-danger" id="btn-delete-video">删除记录</button>
                 <button class="btn btn-danger" id="btn-delete-file" style="background:#991b1b;">删除文件</button>
               </div>

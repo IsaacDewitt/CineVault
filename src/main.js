@@ -20,6 +20,8 @@ const state = {
   totalCount: 0,
   hasMore: false,
   loading: false,
+  seriesList: [],
+  currentSeries: '',
   blockedFolders: (JSON.parse(localStorage.getItem('blockedFolders') || '[]')).filter(function(p) {
     // 过滤掉无效路径（盘符根目录等）
     return p && p.length > 3 && !/^[A-Za-z]:\\?$/.test(p);
@@ -173,25 +175,44 @@ async function fetchVideos(append = false) {
         result = await invoke('get_favorites', { page, pageSize: PAGE_SIZE });
         break;
       case 'series':
-        result = await invoke('get_series', { page, pageSize: PAGE_SIZE });
-        break;
+        // 剧集视图：显示剧集概览，不是单个视频
+        var seriesList = await invoke('get_series_overview');
+        state.videos = [];
+        state.seriesList = seriesList || [];
+        state.totalCount = state.seriesList.length;
+        state.hasMore = false;
+        applyFilters();
+        renderSeriesOverview();
+        updateStats();
+        state.loading = false;
+        return;
       case 'tag':
         if (state.selectedTagIds.length > 0) {
           result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, page, pageSize: PAGE_SIZE });
         } else {
-          result = await invoke('get_videos', { page, pageSize: PAGE_SIZE });
+          result = await invoke('get_movies', { page, pageSize: PAGE_SIZE });
         }
         break;
+      case 'series-episodes':
+        // 显示某个剧集的剧集列表
+        var episodes = await invoke('get_series_episodes', { series: state.currentSeries });
+        state.videos = (episodes || []).map(function(ep) { return { video: ep, tags: ep.tags || [] }; });
+        state.totalCount = state.videos.length;
+        state.hasMore = false;
+        applyFilters();
+        renderVideos();
+        updateStats();
+        state.loading = false;
+        return;
       default:
         if (state.searchQuery) {
           result = await invoke('search_videos', { query: state.searchQuery, page, pageSize: PAGE_SIZE });
         } else {
-          result = await invoke('get_videos', { page, pageSize: PAGE_SIZE });
+          result = await invoke('get_movies', { page, pageSize: PAGE_SIZE });
         }
     }
 
     var items = result.items || [];
-    // 过滤屏蔽的文件夹
     items = items.filter(function(v) { return !isBlocked((v.video || v).file_path); });
     state.totalCount = result.total || 0;
     state.hasMore = result.has_more || false;
@@ -319,6 +340,46 @@ function renderVideos() {
       fetchVideos(true);
     });
   }
+}
+
+// 渲染剧集概览（剧集列表页面）
+function renderSeriesOverview() {
+  var container = document.getElementById('video-container');
+  var emptyState = document.getElementById('empty-state');
+
+  if (!state.seriesList || state.seriesList.length === 0) {
+    container.innerHTML = '';
+    emptyState.classList.remove('hidden');
+    return;
+  }
+
+  emptyState.classList.add('hidden');
+  var html = '';
+  for (var i = 0; i < state.seriesList.length; i++) {
+    var s = state.seriesList[i];
+    var pct = Math.round(s.progress * 100);
+    var ratingStr = s.rating > 0 ? s.rating.toFixed(1) : '-';
+    var sizeStr = formatSize(s.total_size);
+
+    html += '<div class="video-card" data-series="' + s.name + '" style="border-left:3px solid ' + (pct === 100 ? '#10b981' : '#6366f1') + ';">' +
+      '<div class="video-card-title">' + s.name + '</div>' +
+      '<div class="video-card-meta">' + s.watched_episodes + '/' + s.total_episodes + ' 集  ·  ' + sizeStr + '  ·  ★ ' + ratingStr + '</div>' +
+      '<div style="margin-top:6px;background:#252540;border-radius:4px;height:6px;overflow:hidden;">' +
+        '<div style="height:100%;width:' + pct + '%;background:' + (pct === 100 ? '#10b981' : '#6366f1') + ';border-radius:4px;transition:width 0.3s;"></div>' +
+      '</div>' +
+      '<div style="color:#6b6b80;font-size:11px;margin-top:3px;">' + pct + '% 已看完</div>' +
+    '</div>';
+  }
+  container.innerHTML = html;
+
+  // 点击进入剧集详情
+  container.querySelectorAll('.video-card[data-series]').forEach(function(card) {
+    card.onclick = function() {
+      state.currentView = 'series-episodes';
+      state.currentSeries = card.dataset.series;
+      fetchVideos();
+    };
+  });
 }
 
 function renderVideoCard(videoWithTags) {
@@ -539,6 +600,17 @@ function openVideoDetail(videoId) {
   favBtn.textContent = v.is_favorite ? '取消收藏' : '收藏';
   favBtn.className = v.is_favorite ? 'btn btn-secondary' : 'btn btn-warning';
 
+  // 剧集模式下显示返回和全剧按钮
+  var backBtn = document.getElementById('btn-back-series');
+  var markBtn = document.getElementById('btn-mark-series-watched');
+  if (state.currentView === 'series-episodes') {
+    backBtn.classList.remove('hidden');
+    markBtn.classList.remove('hidden');
+  } else {
+    backBtn.classList.add('hidden');
+    markBtn.classList.add('hidden');
+  }
+
   // 显示对话框
   document.getElementById('video-modal').classList.remove('hidden');
 }
@@ -655,7 +727,16 @@ async function startScan() {
   document.getElementById('progress-fill').style.width = '50%';
 
   try {
-    const result = await invoke('scan_videos', { dirPath: path, incremental });
+    var asSeries = document.getElementById('scan-as-series').checked;
+    var result;
+
+    if (asSeries) {
+      // 扫描为剧集：用文件夹名作为剧集名
+      var folderName = path.split('\\').pop().split('/').pop();
+      result = await invoke('scan_series', { dirPath: path, seriesName: folderName, incremental });
+    } else {
+      result = await invoke('scan_videos', { dirPath: path, incremental });
+    }
 
     document.getElementById('progress-fill').style.width = '100%';
     document.getElementById('scan-status').textContent = '扫描完成！';
@@ -950,6 +1031,28 @@ function bindEvents() {
       showToast('导入失败: ' + e, 'error');
     }
   });
+
+  // 返回剧集列表
+  document.getElementById('btn-back-series').onclick = function() {
+    state.currentView = 'series';
+    document.getElementById('video-modal').classList.add('hidden');
+    fetchVideos();
+  };
+
+  // 全剧已看过
+  document.getElementById('btn-mark-series-watched').onclick = async function() {
+    var ok = await showConfirm('标记全剧', '将该剧集所有集标记为已看过？');
+    if (ok) {
+      try {
+        var count = await invoke('mark_series_watched', { series: state.currentSeries, watched: true });
+        showToast('已标记 ' + count + ' 集为已看过');
+        fetchVideos();
+        document.getElementById('video-modal').classList.add('hidden');
+      } catch (e) {
+        showToast('操作失败: ' + e, 'error');
+      }
+    }
+  };
 
   // 切换已看过/未看过
   document.getElementById('btn-watched-toggle').onclick = async function() {

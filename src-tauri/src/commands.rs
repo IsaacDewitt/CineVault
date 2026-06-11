@@ -61,12 +61,14 @@ pub fn scan_videos(
     for file in &video_files {
         let info = scanner::extract_video_info(file);
 
+        let vtype = if info.series_name.is_some() { "episode" } else { "movie" };
         match crate::db::upsert_video(
             &conn,
             &info.title,
             &info.file_path,
             &info.file_name,
             info.file_size,
+            vtype,
             info.series_name.as_deref(),
             info.season,
             info.episode,
@@ -292,6 +294,7 @@ pub fn import_json(db: State<'_, DbConn>, json_str: String) -> Result<ImportResu
             &v.file_path,
             &v.file_name,
             v.file_size,
+            &v.video_type,
             v.series_name.as_deref(),
             v.season,
             v.episode,
@@ -387,6 +390,105 @@ pub fn toggle_watched(db: State<'_, DbConn>, video_id: i64) -> Result<String, St
         }
         Ok("已看过".to_string())
     }
+}
+
+/// 扫描为剧集：选中的文件夹就是一部剧，里面的视频都是剧集
+#[tauri::command]
+pub fn scan_series(
+    db: State<'_, DbConn>,
+    dir_path: String,
+    series_name: String,
+    incremental: bool,
+) -> Result<ScanResult, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    scanner::clear_dir_cache();
+
+    let video_files = if incremental {
+        let mut stmt = conn
+            .prepare("SELECT file_path FROM videos")
+            .map_err(|e| AppError::db(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| AppError::db(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        scanner::scan_directory_incremental(&dir_path, &existing)
+    } else {
+        scanner::scan_directory(&dir_path)
+    };
+
+    let total_found = video_files.len() as i64;
+    if total_found == 0 {
+        return Ok(ScanResult { total_found: 0, new_added: 0, updated: 0, errors: Vec::new(), series_detected: Vec::new() });
+    }
+
+    let mut new_added: i64 = 0;
+    let mut updated: i64 = 0;
+    let mut errors = Vec::new();
+
+    conn.execute_batch("BEGIN").map_err(|e| AppError::db(e.to_string()))?;
+
+    for (idx, file) in video_files.iter().enumerate() {
+        let mut info = scanner::extract_video_info(file);
+        // 强制设为剧集
+        info.series_name = Some(series_name.clone());
+        // 如果没有解析到集数，用序号
+        if info.episode.is_none() {
+            info.episode = Some((idx + 1) as i32);
+        }
+
+        match crate::db::upsert_video(
+            &conn,
+            &info.title,
+            &info.file_path,
+            &info.file_name,
+            info.file_size,
+            "episode",
+            info.series_name.as_deref(),
+            info.season.or(Some(1)),
+            info.episode,
+        ) {
+            Ok(result) => {
+                if result.is_inserted() { new_added += 1; } else { updated += 1; }
+            }
+            Err(e) => { errors.push(format!("{}: {}", info.file_path, e)); }
+        }
+    }
+
+    conn.execute_batch("COMMIT").map_err(|e| AppError::db(e.to_string()))?;
+
+    let mut series_detected = Vec::new();
+    series_detected.push(SeriesInfo { name: series_name, episode_count: new_added + updated, folder_path: dir_path });
+
+    Ok(ScanResult { total_found, new_added, updated, errors, series_detected })
+}
+
+/// 获取电影列表（不含剧集）
+#[tauri::command]
+pub fn get_movies(db: State<'_, DbConn>, page: Option<i64>, page_size: Option<i64>) -> Result<PaginatedVideos, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::query_videos_paginated(&conn, "WHERE v.video_type = 'movie'", &[], page.unwrap_or(0), page_size.unwrap_or(999999)).map_err(|e| e.to_string())
+}
+
+/// 获取剧集概览（按 series_name 分组，含进度）
+#[tauri::command]
+pub fn get_series_overview(db: State<'_, DbConn>) -> Result<Vec<SeriesOverview>, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::get_series_overview(&conn).map_err(|e| e.to_string())
+}
+
+/// 获取某个剧集的所有剧集（按 SxxExx 或集数排序）
+#[tauri::command]
+pub fn get_series_episodes(db: State<'_, DbConn>, series: String) -> Result<Vec<VideoWithTags>, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::get_series_episodes(&conn, &series).map_err(|e| e.to_string())
+}
+
+/// 批量标记剧集为已看过
+#[tauri::command]
+pub fn mark_series_watched(db: State<'_, DbConn>, series: String, watched: bool) -> Result<i64, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::mark_series_watched(&conn, &series, watched).map_err(|e| e.to_string())
 }
 
 /// 修改视频标题

@@ -43,6 +43,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::scan_videos,
+            commands::scan_series,
+            commands::get_movies,
+            commands::get_series_overview,
+            commands::get_series_episodes,
+            commands::mark_series_watched,
             commands::get_videos,
             commands::search_videos,
             commands::get_videos_by_tag,

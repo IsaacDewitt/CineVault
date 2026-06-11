@@ -24,14 +24,15 @@ fn row_to_video(row: &Row) -> rusqlite::Result<Video> {
         duration: row.get(5)?,
         rating: row.get(6)?,
         is_favorite: row.get::<_, i32>(7)? != 0,
-        series_name: row.get(8)?,
-        season: row.get(9)?,
-        episode: row.get(10)?,
-        thumbnail_path: row.get(11)?,
-        last_watched_at: row.get(12)?,
-        watch_progress: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        video_type: row.get(8)?,
+        series_name: row.get(9)?,
+        season: row.get(10)?,
+        episode: row.get(11)?,
+        thumbnail_path: row.get(12)?,
+        last_watched_at: row.get(13)?,
+        watch_progress: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -67,6 +68,7 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             duration REAL,
             rating REAL NOT NULL DEFAULT 0,
             is_favorite INTEGER NOT NULL DEFAULT 0,
+            video_type TEXT NOT NULL DEFAULT 'movie',
             series_name TEXT,
             season INTEGER,
             episode INTEGER,
@@ -138,7 +140,7 @@ pub fn query_videos_paginated(
     let sql = format!(
         "SELECT
             v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating,
-            v.is_favorite, v.series_name, v.season, v.episode, v.thumbnail_path,
+            v.is_favorite, v.video_type, v.series_name, v.season, v.episode, v.thumbnail_path,
             v.last_watched_at, v.watch_progress, v.created_at, v.updated_at,
             GROUP_CONCAT(t.id || '\x1F' || t.name || '\x1F' || t.color, '\x1E')
          FROM videos v
@@ -325,8 +327,28 @@ pub fn delete_tag(conn: &Connection, tag_id: i64) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 给视频添加标签
+/// 给视频添加标签（已看过/未看过互斥）
 pub fn add_tag_to_video(conn: &Connection, video_id: i64, tag_id: i64) -> Result<(), AppError> {
+    // 查看要添加的标签名
+    let tag_name: String = conn.query_row(
+        "SELECT name FROM tags WHERE id = ?1",
+        params![tag_id],
+        |r| r.get(0),
+    ).unwrap_or_default();
+
+    // 如果是"已看过"或"未看过"，先移除互斥的那个
+    let opposite = match tag_name.as_str() {
+        "已看过" => Some("未看过"),
+        "未看过" => Some("已看过"),
+        _ => None,
+    };
+    if let Some(opposite_name) = opposite {
+        conn.execute(
+            "DELETE FROM video_tags WHERE video_id = ?1 AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+            params![video_id, opposite_name],
+        )?;
+    }
+
     conn.execute(
         "INSERT OR IGNORE INTO video_tags (video_id, tag_id) VALUES (?1, ?2)",
         params![video_id, tag_id],
@@ -351,6 +373,7 @@ pub fn upsert_video(
     file_path: &str,
     file_name: &str,
     file_size: i64,
+    video_type: &str,
     series_name: Option<&str>,
     season: Option<i32>,
     episode: Option<i32>,
@@ -365,18 +388,18 @@ pub fn upsert_video(
         Ok(id) => {
             conn.execute(
                 "UPDATE videos SET title = ?1, file_name = ?2, file_size = ?3,
-                 series_name = ?4, season = ?5, episode = ?6,
+                 video_type = ?4, series_name = ?5, season = ?6, episode = ?7,
                  updated_at = datetime('now','localtime')
-                 WHERE id = ?7",
-                params![title, file_name, file_size, series_name, season, episode, id],
+                 WHERE id = ?8",
+                params![title, file_name, file_size, video_type, series_name, season, episode, id],
             )?;
             Ok(UpsertResult::Updated(id))
         }
         Err(_) => {
             conn.execute(
-                "INSERT INTO videos (title, file_path, file_name, file_size, series_name, season, episode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![title, file_path, file_name, file_size, series_name, season, episode],
+                "INSERT INTO videos (title, file_path, file_name, file_size, video_type, series_name, season, episode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![title, file_path, file_name, file_size, video_type, series_name, season, episode],
             )?;
             let new_id = conn.last_insert_rowid();
         // 新视频默认标记"未看过"
@@ -442,4 +465,102 @@ pub fn export_data(conn: &Connection) -> Result<ExportData, AppError> {
 pub fn delete_video(conn: &Connection, video_id: i64) -> Result<(), AppError> {
     conn.execute("DELETE FROM videos WHERE id = ?1", params![video_id])?;
     Ok(())
+}
+
+/// 获取剧集概览（按 series_name 分组，含观看进度）
+pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            v.series_name,
+            COUNT(*) as total,
+            SUM(CASE WHEN EXISTS (
+                SELECT 1 FROM video_tags vt
+                INNER JOIN tags t ON vt.tag_id = t.id
+                WHERE vt.video_id = v.id AND t.name = '已看过'
+            ) THEN 1 ELSE 0 END) as watched,
+            COALESCE(SUM(v.file_size), 0),
+            COALESCE(AVG(CASE WHEN v.rating > 0 THEN v.rating END), 0)
+         FROM videos v
+         WHERE v.video_type = 'episode' AND v.series_name IS NOT NULL
+         GROUP BY v.series_name
+         ORDER BY v.series_name"
+    )?;
+
+    let series = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let total: i64 = row.get(1)?;
+        let watched: i64 = row.get(2)?;
+        let total_size: i64 = row.get(3)?;
+        let rating: f64 = row.get(4)?;
+        let progress = if total > 0 { watched as f64 / total as f64 } else { 0.0 };
+        Ok(SeriesOverview { name, total_episodes: total, watched_episodes: watched, progress, total_size, rating })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(series)
+}
+
+/// 获取某个剧集的所有剧集（按 SxxExx 或集数排序）
+pub fn get_series_episodes(conn: &Connection, series_name: &str) -> Result<Vec<VideoWithTags>, AppError> {
+    let sql = format!(
+        "SELECT
+            v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating,
+            v.is_favorite, v.video_type, v.series_name, v.season, v.episode, v.thumbnail_path,
+            v.last_watched_at, v.watch_progress, v.created_at, v.updated_at,
+            GROUP_CONCAT(t.id || '\x1F' || t.name || '\x1F' || t.color, '\x1E')
+         FROM videos v
+         LEFT JOIN video_tags vt ON v.id = vt.video_id
+         LEFT JOIN tags t ON vt.tag_id = t.id
+         WHERE v.series_name = ?1
+         GROUP BY v.id
+         ORDER BY COALESCE(v.season, 1), COALESCE(v.episode, 999999)"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let videos = stmt.query_map(params![series_name], |row| {
+        let video = row_to_video(row)?;
+        let tags_str: Option<String> = row.get(17)?;
+        let tags = parse_tags_string(tags_str);
+        Ok(VideoWithTags { video, tags })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(videos)
+}
+
+/// 批量标记剧集为已看过/未看过
+pub fn mark_series_watched(conn: &Connection, series_name: &str, watched: bool) -> Result<i64, AppError> {
+    let tag_name = if watched { "已看过" } else { "未看过" };
+    let opposite = if watched { "未看过" } else { "已看过" };
+
+    // 获取目标标签 ID
+    let tag_id: i64 = conn.query_row(
+        "SELECT id FROM tags WHERE name = ?1",
+        params![tag_name],
+        |r| r.get(0),
+    )?;
+
+    // 获取互斥标签 ID
+    let opposite_id: Option<i64> = conn.query_row(
+        "SELECT id FROM tags WHERE name = ?1",
+        params![opposite],
+        |r| r.get(0),
+    ).ok();
+
+    // 获取该剧集所有视频 ID
+    let mut stmt = conn.prepare("SELECT id FROM videos WHERE series_name = ?1")?;
+    let video_ids: Vec<i64> = stmt.query_map(params![series_name], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut count = 0i64;
+    for vid in &video_ids {
+        // 移除互斥标签
+        if let Some(oid) = opposite_id {
+            let _ = conn.execute("DELETE FROM video_tags WHERE video_id = ?1 AND tag_id = ?2", params![vid, oid]);
+        }
+        // 添加目标标签
+        let _ = conn.execute("INSERT OR IGNORE INTO video_tags (video_id, tag_id) VALUES (?1, ?2)", params![vid, tag_id]);
+        count += 1;
+    }
+
+    Ok(count)
 }
