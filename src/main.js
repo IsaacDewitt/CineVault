@@ -22,71 +22,7 @@ const state = {
   loading: false,
   seriesList: [],
   currentSeries: '',
-  blockedFolders: (JSON.parse(localStorage.getItem('blockedFolders') || '[]')).filter(function(p) {
-    // 过滤掉无效路径（盘符根目录等）
-    return p && p.length > 3 && !/^[A-Za-z]:\\?$/.test(p);
-  }),
 };
-
-// 屏蔽文件夹管理
-function saveBlockedFolders() {
-  localStorage.setItem('blockedFolders', JSON.stringify(state.blockedFolders));
-}
-
-function addBlockedFolder(path) {
-  path = path.replace(/\//g, '\\').replace(/\\$/, '');
-  // 不允许屏蔽盘符根目录
-  if (/^[A-Za-z]:\\?$/.test(path)) {
-    showToast('不能屏蔽整个磁盘', 'error');
-    return;
-  }
-  if (path && path.length > 3 && !state.blockedFolders.includes(path)) {
-    state.blockedFolders.push(path);
-    saveBlockedFolders();
-  }
-}
-
-function removeBlockedFolder(path) {
-  state.blockedFolders = state.blockedFolders.filter(p => p !== path);
-  saveBlockedFolders();
-}
-
-function isBlocked(filePath) {
-  if (!filePath || state.blockedFolders.length === 0) return false;
-  // 统一转小写 + 去掉末尾斜杠 + 统一用反斜杠
-  var normalized = filePath.toLowerCase().replace(/\//g, '\\').replace(/\\$/, '');
-  for (var i = 0; i < state.blockedFolders.length; i++) {
-    var blocked = state.blockedFolders[i].toLowerCase().replace(/\//g, '\\').replace(/\\$/, '');
-    if (normalized === blocked || normalized.startsWith(blocked + '\\')) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function renderBlockList() {
-  var list = document.getElementById('block-list');
-  if (!list) return;
-  if (state.blockedFolders.length === 0) {
-    list.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:8px;">暂无屏蔽文件夹</div>';
-    return;
-  }
-  var html = '';
-  for (var i = 0; i < state.blockedFolders.length; i++) {
-    html += '<div class="tag-manage-item">' +
-      '<span style="flex:1;font-size:13px;word-break:break-all;">' + state.blockedFolders[i] + '</span>' +
-      '<button class="btn-delete-tag" data-path="' + state.blockedFolders[i] + '" style="cursor:pointer;">✕</button>' +
-    '</div>';
-  }
-  list.innerHTML = html;
-  list.querySelectorAll('.btn-delete-tag').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      removeBlockedFolder(btn.dataset.path);
-      renderBlockList();
-      showToast('已移除屏蔽');
-    });
-  });
-}
 
 // ============================================
 // 工具函数
@@ -213,7 +149,6 @@ async function fetchVideos(append = false) {
     }
 
     var items = result.items || [];
-    items = items.filter(function(v) { return !isBlocked((v.video || v).file_path); });
     state.totalCount = result.total || 0;
     state.hasMore = result.has_more || false;
     state.currentPage = result.page || 0;
@@ -1081,77 +1016,6 @@ function bindEvents() {
       showToast('改名失败: ' + e, 'error');
     }
   };
-
-  // 屏蔽文件夹
-  var btnBlock = document.getElementById('btn-block');
-  if (btnBlock) {
-    btnBlock.onclick = function() {
-      var modal = document.getElementById('block-modal');
-      modal.classList.remove('hidden');
-      renderBlockList();
-    };
-  }
-
-  var blockClose = document.getElementById('block-close');
-  if (blockClose) {
-    blockClose.onclick = function() {
-      document.getElementById('block-modal').classList.add('hidden');
-    };
-  }
-
-  var btnBrowseBlock = document.getElementById('btn-browse-block');
-  if (btnBrowseBlock) {
-    btnBrowseBlock.onclick = async function() {
-      try {
-        var selected = await open({ directory: true, multiple: false });
-        if (selected) {
-          document.getElementById('new-block-path').value = selected;
-        }
-      } catch (e) {
-        console.error('选择文件夹失败:', e);
-      }
-    };
-  }
-
-  var btnAddBlock = document.getElementById('btn-add-block');
-  if (btnAddBlock) {
-    btnAddBlock.onclick = async function() {
-      var input = document.getElementById('new-block-path');
-      var path = input.value.trim();
-      if (path) {
-        addBlockedFolder(path);
-        input.value = '';
-        renderBlockList();
-        try {
-          var deleted = await invoke('delete_videos_by_folder', { folderPath: path });
-          showToast('已删除 ' + deleted + ' 条记录');
-        } catch (e) {
-          showToast('删除失败: ' + e, 'error');
-        }
-        fetchVideos();
-        fetchStats();
-      }
-    };
-  }
-
-  var btnClearBlocks = document.getElementById('btn-clear-blocks');
-  if (btnClearBlocks) {
-    btnClearBlocks.onclick = function() {
-      state.blockedFolders = [];
-      saveBlockedFolders();
-      renderBlockList();
-      showToast('已清除所有屏蔽');
-      fetchVideos();
-    };
-  }
-
-  // 屏蔽对话框的遮罩关闭
-  var blockOverlay = document.querySelector('#block-modal .modal-overlay');
-  if (blockOverlay) {
-    blockOverlay.onclick = function() {
-      document.getElementById('block-modal').classList.add('hidden');
-    };
-  }
 
   // 关闭对话框（点击遮罩）
   document.querySelectorAll('.modal-overlay').forEach(overlay => {

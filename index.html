@@ -48,10 +48,6 @@
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
           <span>扫描</span>
         </button>
-        <button class="btn-icon" id="btn-block" title="屏蔽文件夹">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zM4 12c0-4.42 3.58-8 8-8 1.85 0 3.55.63 4.9 1.69L5.69 16.9C4.63 15.55 4 13.85 4 12zm8 8c-1.85 0-3.55-.63-4.9-1.69L18.31 7.1C19.37 8.45 20 10.15 20 12c0 4.42-3.58 8-8 8z"/></svg>
-          <span>屏蔽</span>
-        </button>
         <button class="btn-icon" id="btn-export" title="导出数据">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
           <span>导出</span>
@@ -224,29 +220,6 @@
               </div>
             </div>
           </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 屏蔽文件夹对话框 -->
-  <div id="block-modal" class="modal hidden">
-    <div class="modal-overlay"></div>
-    <div class="modal-content">
-      <div class="modal-header">
-        <h2>屏蔽文件夹</h2>
-        <button class="btn-close" id="block-close">&times;</button>
-      </div>
-      <div class="modal-body">
-        <p style="color:var(--text-secondary);font-size:13px;margin-bottom:12px;">屏蔽后，这些文件夹下的视频不会被扫描和显示</p>
-        <div class="tag-create">
-          <input type="text" id="new-block-path" placeholder="文件夹路径" style="flex:1;" />
-          <button class="btn btn-secondary" id="btn-browse-block">浏览</button>
-          <button class="btn btn-primary" id="btn-add-block">添加</button>
-        </div>
-        <div id="block-list" class="tag-manage-list" style="margin-top:12px;"></div>
-        <div style="margin-top:12px;text-align:right;">
-          <button class="btn btn-secondary" id="btn-clear-blocks" style="font-size:12px;">清除所有屏蔽</button>
         </div>
       </div>
     </div>
