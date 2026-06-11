@@ -1,0 +1,1260 @@
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
+
+// ============================================
+// 应用状态
+// ============================================
+const PAGE_SIZE = 999999;
+
+const state = {
+  videos: [],
+  tags: [],
+  currentView: 'all',
+  selectedTagIds: [],
+  viewMode: 'grid',
+  sortBy: 'updated',
+  ratingFilter: 0,
+  searchQuery: '',
+  selectedVideoId: null,
+  currentPage: 0,
+  totalCount: 0,
+  hasMore: false,
+  loading: false,
+  blockedFolders: (JSON.parse(localStorage.getItem('blockedFolders') || '[]')).filter(function(p) {
+    // 过滤掉无效路径（盘符根目录等）
+    return p && p.length > 3 && !/^[A-Za-z]:\\?$/.test(p);
+  }),
+};
+
+// 屏蔽文件夹管理
+function saveBlockedFolders() {
+  localStorage.setItem('blockedFolders', JSON.stringify(state.blockedFolders));
+}
+
+function addBlockedFolder(path) {
+  path = path.replace(/\//g, '\\').replace(/\\$/, '');
+  // 不允许屏蔽盘符根目录
+  if (/^[A-Za-z]:\\?$/.test(path)) {
+    showToast('不能屏蔽整个磁盘', 'error');
+    return;
+  }
+  if (path && path.length > 3 && !state.blockedFolders.includes(path)) {
+    state.blockedFolders.push(path);
+    saveBlockedFolders();
+  }
+}
+
+function removeBlockedFolder(path) {
+  state.blockedFolders = state.blockedFolders.filter(p => p !== path);
+  saveBlockedFolders();
+}
+
+function isBlocked(filePath) {
+  if (!filePath || state.blockedFolders.length === 0) return false;
+  // 统一转小写 + 去掉末尾斜杠 + 统一用反斜杠
+  var normalized = filePath.toLowerCase().replace(/\//g, '\\').replace(/\\$/, '');
+  for (var i = 0; i < state.blockedFolders.length; i++) {
+    var blocked = state.blockedFolders[i].toLowerCase().replace(/\//g, '\\').replace(/\\$/, '');
+    if (normalized === blocked || normalized.startsWith(blocked + '\\')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function renderBlockList() {
+  var list = document.getElementById('block-list');
+  if (!list) return;
+  if (state.blockedFolders.length === 0) {
+    list.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:8px;">暂无屏蔽文件夹</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < state.blockedFolders.length; i++) {
+    html += '<div class="tag-manage-item">' +
+      '<span style="flex:1;font-size:13px;word-break:break-all;">' + state.blockedFolders[i] + '</span>' +
+      '<button class="btn-delete-tag" data-path="' + state.blockedFolders[i] + '" style="cursor:pointer;">✕</button>' +
+    '</div>';
+  }
+  list.innerHTML = html;
+  list.querySelectorAll('.btn-delete-tag').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      removeBlockedFolder(btn.dataset.path);
+      renderBlockList();
+      showToast('已移除屏蔽');
+    });
+  });
+}
+
+// ============================================
+// 工具函数
+// ============================================
+function formatSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
+}
+
+function renderRatingStars(rating, interactive = false) {
+  const full = Math.floor(rating / 2);
+  const half = (rating / 2) % 1 >= 0.5 ? 1 : 0;
+  let html = '';
+  for (let i = 0; i < 5; i++) {
+    if (i < full) {
+      html += '<span class="star active">★</span>';
+    } else if (i === full && half) {
+      html += '<span class="star active">★</span>';
+    } else {
+      html += '<span class="star">☆</span>';
+    }
+  }
+  return html;
+}
+
+function renderRatingInput(rating) {
+  let html = '';
+  for (let i = 1; i <= 10; i++) {
+    const active = i <= rating ? 'active' : '';
+    html += `<button class="star-btn ${active}" data-rating="${i}">${i <= rating ? '★' : '☆'}</button>`;
+  }
+  html += `<span class="rating-value">${rating.toFixed(1)}</span>`;
+  return html;
+}
+
+// 自定义确认对话框（Tauri WebView 的 confirm 不可靠）
+function showConfirm(title, message) {
+  return new Promise(function(resolve) {
+    var modal = document.getElementById('confirm-modal');
+    document.getElementById('confirm-title').textContent = title;
+    document.getElementById('confirm-message').textContent = message;
+    modal.classList.remove('hidden');
+
+    var okBtn = document.getElementById('confirm-ok');
+    var cancelBtn = document.getElementById('confirm-cancel');
+
+    function cleanup() {
+      modal.classList.add('hidden');
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+    }
+
+    okBtn.onclick = function() { cleanup(); resolve(true); };
+    cancelBtn.onclick = function() { cleanup(); resolve(false); };
+    modal.querySelector('.modal-overlay').onclick = function() { cleanup(); resolve(false); };
+  });
+}
+
+function showToast(message, type = 'success') {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  setTimeout(() => toast.remove(), 3000);
+}
+
+// ============================================
+// Tauri API 调用
+// ============================================
+async function fetchVideos(append = false) {
+  if (state.loading) return;
+  state.loading = true;
+
+  try {
+    const page = append ? state.currentPage : 0;
+    let result;
+
+    switch (state.currentView) {
+      case 'favorites':
+        result = await invoke('get_favorites', { page, pageSize: PAGE_SIZE });
+        break;
+      case 'series':
+        result = await invoke('get_series', { page, pageSize: PAGE_SIZE });
+        break;
+      case 'tag':
+        if (state.selectedTagIds.length > 0) {
+          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, page, pageSize: PAGE_SIZE });
+        } else {
+          result = await invoke('get_videos', { page, pageSize: PAGE_SIZE });
+        }
+        break;
+      default:
+        if (state.searchQuery) {
+          result = await invoke('search_videos', { query: state.searchQuery, page, pageSize: PAGE_SIZE });
+        } else {
+          result = await invoke('get_videos', { page, pageSize: PAGE_SIZE });
+        }
+    }
+
+    var items = result.items || [];
+    // 过滤屏蔽的文件夹
+    items = items.filter(function(v) { return !isBlocked((v.video || v).file_path); });
+    state.totalCount = result.total || 0;
+    state.hasMore = result.has_more || false;
+    state.currentPage = result.page || 0;
+
+    if (append) {
+      state.videos = [...state.videos, ...items];
+    } else {
+      state.videos = items;
+    }
+
+    applyFilters();
+    renderVideos();
+    updateStats();
+  } catch (e) {
+    console.error('获取视频失败:', e);
+    showToast('获取视频失败: ' + e, 'error');
+  } finally {
+    state.loading = false;
+  }
+}
+
+async function fetchTags() {
+  try {
+    state.tags = await invoke('get_tags') || [];
+    renderTags();
+  } catch (e) {
+    console.error('获取标签失败:', e);
+  }
+}
+
+async function fetchHistory() {
+  try {
+    const history = await invoke('get_history', { limit: 50 });
+    renderHistory(history || []);
+  } catch (e) {
+    console.error('获取历史失败:', e);
+  }
+}
+
+async function fetchStats() {
+  try {
+    const stats = await invoke('get_stats');
+    updateStatsDisplay(stats);
+  } catch (e) {
+    console.error('获取统计失败:', e);
+  }
+}
+
+// ============================================
+// 渲染视频列表
+// ============================================
+function applyFilters() {
+  let videos = [...state.videos];
+
+  // 获取视频属性（兼容 flatten 和嵌套结构）
+  const getVideo = (item) => item.video || item;
+
+  // 评分过滤
+  if (state.ratingFilter > 0) {
+    videos = videos.filter(v => getVideo(v).rating >= state.ratingFilter);
+  }
+
+  // 排序
+  switch (state.sortBy) {
+    case 'name':
+      videos.sort((a, b) => (getVideo(a).title || '').localeCompare(getVideo(b).title || ''));
+      break;
+    case 'size':
+      videos.sort((a, b) => (getVideo(b).file_size || 0) - (getVideo(a).file_size || 0));
+      break;
+    case 'rating':
+      videos.sort((a, b) => (getVideo(b).rating || 0) - (getVideo(a).rating || 0));
+      break;
+    case 'updated':
+    default:
+      videos.sort((a, b) => new Date(getVideo(b).updated_at || 0) - new Date(getVideo(a).updated_at || 0));
+  }
+
+  state.videos = videos;
+}
+
+function renderVideos() {
+  const container = document.getElementById('video-container');
+  const emptyState = document.getElementById('empty-state');
+
+  if (state.videos.length === 0) {
+    container.innerHTML = '';
+    emptyState.classList.remove('hidden');
+    return;
+  }
+
+  emptyState.classList.add('hidden');
+
+  let html = state.videos.map(v => renderVideoCard(v)).join('');
+
+  // 加载更多按钮
+  if (state.hasMore) {
+    html += `<div class="load-more-container" style="grid-column:1/-1;text-align:center;padding:20px;">
+      <button class="btn btn-primary" id="btn-load-more">
+        加载更多 (${state.videos.length}/${state.totalCount})
+      </button>
+    </div>`;
+  } else if (state.totalCount > PAGE_SIZE) {
+    html += `<div style="grid-column:1/-1;text-align:center;padding:20px;color:var(--text-muted);font-size:13px;">
+      已加载全部 ${state.totalCount} 个视频
+    </div>`;
+  }
+
+  container.innerHTML = html;
+
+  // 绑定点击事件
+  container.querySelectorAll('.video-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const id = parseInt(card.dataset.id);
+      openVideoDetail(id);
+    });
+  });
+
+  // 加载更多按钮事件
+  const loadMoreBtn = document.getElementById('btn-load-more');
+  if (loadMoreBtn) {
+    loadMoreBtn.addEventListener('click', () => {
+      state.currentPage++;
+      fetchVideos(true);
+    });
+  }
+}
+
+function renderVideoCard(videoWithTags) {
+  var v = videoWithTags.video || videoWithTags;
+  var tags = videoWithTags.tags || [];
+  var title = v.title || v.file_name || '(unknown)';
+  var isSeries = !!v.series_name;
+  var favMark = v.is_favorite ? ' ★' : '';
+  var seriesMark = isSeries ? ' [' + v.series_name + ']' : '';
+  var ratingStr = v.rating > 0 ? v.rating.toFixed(1) : '-';
+  var sizeStr = formatSize(v.file_size || 0);
+
+  // 检查是否已看过/未看过，设置不同边框颜色
+  var borderColor = 'transparent';
+  for (var i = 0; i < tags.length; i++) {
+    if (tags[i].name === '已看过') { borderColor = '#10b981'; break; }
+    if (tags[i].name === '未看过') { borderColor = '#6b6b80'; break; }
+  }
+
+  return '<div class="video-card" data-id="' + v.id + '" style="border-left:3px solid ' + borderColor + ';">' +
+    '<div class="video-card-title">' + title + seriesMark + favMark + '</div>' +
+    '<div class="video-card-meta">' + sizeStr + '  ·  ★ ' + ratingStr + '</div>' +
+  '</div>';
+}
+
+// ============================================
+// 渲染历史记录
+// ============================================
+function renderHistory(history) {
+  const container = document.getElementById('video-container');
+  const emptyState = document.getElementById('empty-state');
+
+  if (history.length === 0) {
+    container.innerHTML = '';
+    emptyState.classList.remove('hidden');
+    return;
+  }
+
+  emptyState.classList.add('hidden');
+  container.innerHTML = history.map(h => `
+    <div class="video-card" data-id="${h.video_id}">
+      <div class="video-thumb">
+        <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+          <path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/>
+        </svg>
+      </div>
+      <div class="video-info">
+        <div class="video-title">${h.video_title || '未知'}</div>
+        <div class="video-meta">
+          <span>观看于 ${new Date(h.watched_at).toLocaleString('zh-CN')}</span>
+          <span>${(h.progress * 100).toFixed(0)}%</span>
+        </div>
+      </div>
+    </div>
+  `).join('');
+
+  container.querySelectorAll('.video-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const id = parseInt(card.dataset.id);
+      openVideoDetail(id);
+    });
+  });
+}
+
+// ============================================
+// 渲染标签
+// ============================================
+function renderTags() {
+  const tagList = document.getElementById('tag-list');
+  tagList.innerHTML = state.tags.map(t => `
+    <div class="tag-nav-item" data-tag-id="${t.id}">
+      <span class="tag-dot" style="background:${t.color}"></span>
+      <span>${t.name}</span>
+      <span class="tag-count">${t.video_count || 0}</span>
+    </div>
+  `).join('');
+
+  tagList.querySelectorAll('.tag-nav-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const tagId = parseInt(item.dataset.tagId);
+      state.currentView = 'tag';
+
+      // 多选：Ctrl+点击切换，普通点击替换
+      if (window.event && window.event.ctrlKey) {
+        var idx = state.selectedTagIds.indexOf(tagId);
+        if (idx >= 0) {
+          state.selectedTagIds.splice(idx, 1);
+        } else {
+          state.selectedTagIds.push(tagId);
+        }
+      } else {
+        // 单击：如果已选中则取消，否则选中
+        var idx2 = state.selectedTagIds.indexOf(tagId);
+        if (idx2 >= 0) {
+          state.selectedTagIds.splice(idx2, 1);
+        } else {
+          state.selectedTagIds = [tagId];
+        }
+      }
+
+      // 如果全部取消选中，回到全部视图
+      if (state.selectedTagIds.length === 0) {
+        state.currentView = 'all';
+      }
+
+      updateNavActive();
+      highlightSelectedTags();
+      fetchVideos();
+    });
+  });
+}
+
+function highlightSelectedTags() {
+  document.querySelectorAll('.tag-nav-item').forEach(item => {
+    var tagId = parseInt(item.dataset.tagId);
+    if (state.selectedTagIds.indexOf(tagId) >= 0) {
+      item.style.background = 'rgba(99, 102, 241, 0.2)';
+      item.style.borderLeft = '3px solid #6366f1';
+    } else {
+      item.style.background = '';
+      item.style.borderLeft = '';
+    }
+  });
+}
+
+// ============================================
+// 更新导航栏
+// ============================================
+function updateNavActive() {
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.classList.remove('active');
+    if (item.dataset.view === state.currentView) {
+      item.classList.add('active');
+    }
+  });
+}
+
+// ============================================
+// 更新统计信息
+// ============================================
+function updateStats() {
+  const getVideo = (item) => item.video || item;
+  document.getElementById('stat-total').textContent = `${state.totalCount} 个视频`;
+}
+
+function updateStatsDisplay(stats) {
+  document.getElementById('count-all').textContent = stats.total_videos;
+  document.getElementById('count-fav').textContent = stats.favorites_count;
+  document.getElementById('count-series').textContent = stats.total_series;
+  document.getElementById('stat-series').textContent = `${stats.total_series} 个剧集`;
+  document.getElementById('stat-size').textContent = `总大小 ${formatSize(stats.total_size)}`;
+}
+
+// ============================================
+// 视频详情对话框
+// ============================================
+function openVideoDetail(videoId) {
+  const videoData = state.videos.find(v => (v.video || v).id === videoId);
+  if (!videoData) return;
+
+  state.selectedVideoId = videoId;
+  const v = videoData.video || videoData;
+  const tags = videoData.tags || [];
+
+  document.getElementById('video-detail-title').textContent = v.title || v.file_name;
+  document.getElementById('detail-title-input').value = v.title || v.file_name;
+  document.getElementById('detail-path').textContent = v.file_path;
+  document.getElementById('detail-size').textContent = formatSize(v.file_size);
+
+  // 评分（事件委托，解决 innerHTML 替换后事件丢失问题）
+  var ratingDiv = document.getElementById('detail-rating');
+  ratingDiv.innerHTML = renderRatingInput(v.rating);
+  ratingDiv.onclick = async function(e) {
+    var btn = e.target.closest('.star-btn');
+    if (!btn) return;
+    var newRating = parseInt(btn.dataset.rating);
+    try {
+      await invoke('set_rating', { videoId: v.id, rating: newRating });
+      v.rating = newRating;
+      ratingDiv.innerHTML = renderRatingInput(newRating);
+      showToast('评分已更新为 ' + newRating);
+      fetchVideos();
+    } catch (err) {
+      showToast('评分失败: ' + err, 'error');
+    }
+  };
+
+  // 标签
+  const tagsDiv = document.getElementById('detail-tags');
+  tagsDiv.innerHTML = tags.map(t =>
+    `<span class="tag-chip" style="background:${t.color}">${t.name} <span data-tag-id="${t.id}" class="remove-tag" style="cursor:pointer;margin-left:4px">✕</span></span>`
+  ).join('') + `<button class="btn btn-secondary" id="btn-add-tag-to-video" style="padding:4px 10px;font-size:12px">+ 添加标签</button>`;
+
+  // 删除标签事件
+  tagsDiv.querySelectorAll('.remove-tag').forEach(el => {
+    el.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const tagId = parseInt(el.dataset.tagId);
+      try {
+        await invoke('remove_video_tag', { videoId: v.id, tagId });
+        showToast('标签已移除');
+        fetchVideos();
+        fetchTags();
+        openVideoDetail(videoId);
+      } catch (e) {
+        showToast('移除标签失败: ' + e, 'error');
+      }
+    });
+  });
+
+  // 添加标签按钮
+  document.getElementById('btn-add-tag-to-video').addEventListener('click', () => {
+    showTagSelector(v.id);
+  });
+
+  // 收藏按钮
+  const favBtn = document.getElementById('btn-fav-toggle');
+  favBtn.textContent = v.is_favorite ? '取消收藏' : '收藏';
+  favBtn.className = v.is_favorite ? 'btn btn-secondary' : 'btn btn-warning';
+
+  // 显示对话框
+  document.getElementById('video-modal').classList.remove('hidden');
+}
+
+function showTagSelector(videoId) {
+  // 已经绑定在该视频上的标签 ID
+  var boundIds = [];
+  document.querySelectorAll('#detail-tags .remove-tag').forEach(function(el) {
+    boundIds.push(parseInt(el.dataset.tagId));
+  });
+
+  var available = state.tags.filter(function(t) { return boundIds.indexOf(t.id) === -1; });
+
+  // 构建选择列表 HTML
+  var listHtml = '';
+  for (var i = 0; i < available.length; i++) {
+    listHtml += '<div class="tag-select-item" data-tag-id="' + available[i].id + '" style="display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;border-radius:6px;transition:background 0.15s;">' +
+      '<span style="width:12px;height:12px;border-radius:50%;background:' + available[i].color + ';flex-shrink:0;"></span>' +
+      '<span style="color:#e8e8e8;font-size:14px;">' + available[i].name + '</span>' +
+    '</div>';
+  }
+  if (available.length === 0) {
+    listHtml = '<div style="color:#6b6b80;font-size:13px;padding:8px;">暂无可用标签，请在下方创建</div>';
+  }
+
+  // 创建内联选择器
+  var existing = document.getElementById('tag-selector-inline');
+  if (existing) existing.remove();
+
+  var selector = document.createElement('div');
+  selector.id = 'tag-selector-inline';
+  selector.style.cssText = 'background:#1a1a2e;border:1px solid #2d2d4a;border-radius:8px;padding:12px;margin-top:8px;';
+  selector.innerHTML =
+    '<div style="color:#a0a0b8;font-size:12px;margin-bottom:8px;">选择标签：</div>' +
+    '<div id="tag-selector-list" style="max-height:200px;overflow-y:auto;">' + listHtml + '</div>' +
+    '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #2d2d4a;">' +
+      '<div style="color:#a0a0b8;font-size:12px;margin-bottom:6px;">或创建新标签：</div>' +
+      '<div style="display:flex;gap:6px;">' +
+        '<input type="text" id="tag-selector-new-name" placeholder="标签名" style="flex:1;padding:6px 10px;background:#252540;border:1px solid #2d2d4a;border-radius:6px;color:#e8e8e8;font-size:13px;font-family:var(--font);" />' +
+        '<input type="color" id="tag-selector-new-color" value="#6366f1" style="width:36px;height:32px;border:1px solid #2d2d4a;border-radius:6px;cursor:pointer;background:transparent;padding:2px;" />' +
+        '<button id="tag-selector-create" style="padding:6px 12px;background:#6366f1;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;">创建</button>' +
+      '</div>' +
+    '</div>';
+
+  // 插入到详情标签区域后面
+  var tagsDiv = document.getElementById('detail-tags');
+  tagsDiv.parentNode.insertBefore(selector, tagsDiv.nextSibling);
+
+  // 绑定已有标签点击
+  selector.querySelectorAll('.tag-select-item').forEach(function(item) {
+    item.onmouseenter = function() { item.style.background = '#252540'; };
+    item.onmouseleave = function() { item.style.background = 'transparent'; };
+    item.onclick = async function() {
+      var tagId = parseInt(item.dataset.tagId);
+      try {
+        await invoke('add_video_tag', { videoId: videoId, tagId: tagId });
+        showToast('标签已添加');
+        selector.remove();
+        fetchVideos();
+        fetchTags();
+        openVideoDetail(videoId);
+      } catch (e) {
+        showToast('添加失败: ' + e, 'error');
+      }
+    };
+  });
+
+  // 绑定创建新标签
+  var createBtn = document.getElementById('tag-selector-create');
+  if (createBtn) {
+    createBtn.onclick = async function() {
+      var nameInput = document.getElementById('tag-selector-new-name');
+      var colorInput = document.getElementById('tag-selector-new-color');
+      var name = nameInput.value.trim();
+      if (!name) { showToast('请输入标签名', 'error'); return; }
+      try {
+        var newTag = await invoke('create_tag', { name: name, color: colorInput.value });
+        await invoke('add_video_tag', { videoId: videoId, tagId: newTag.id });
+        showToast('标签已创建并添加');
+        selector.remove();
+        fetchVideos();
+        fetchTags();
+        openVideoDetail(videoId);
+      } catch (e) {
+        showToast('创建失败: ' + e, 'error');
+      }
+    };
+  }
+}
+
+// ============================================
+// 扫描对话框
+// ============================================
+function openScanDialog() {
+  document.getElementById('scan-modal').classList.remove('hidden');
+  document.getElementById('scan-result').classList.add('hidden');
+  document.getElementById('scan-progress').classList.add('hidden');
+  document.getElementById('scan-path').value = '';
+}
+
+async function startScan() {
+  const path = document.getElementById('scan-path').value;
+  if (!path) {
+    showToast('请先选择文件夹', 'error');
+    return;
+  }
+
+  const incremental = document.getElementById('incremental-scan').checked;
+
+  document.getElementById('scan-progress').classList.remove('hidden');
+  document.getElementById('scan-result').classList.add('hidden');
+  document.getElementById('btn-start-scan').disabled = true;
+  document.getElementById('scan-status').textContent = '扫描中...';
+  document.getElementById('progress-fill').style.width = '50%';
+
+  try {
+    const result = await invoke('scan_videos', { dirPath: path, incremental });
+
+    document.getElementById('progress-fill').style.width = '100%';
+    document.getElementById('scan-status').textContent = '扫描完成！';
+
+    const resultDiv = document.getElementById('scan-result');
+    resultDiv.classList.remove('hidden');
+    resultDiv.innerHTML = `
+      <p>✅ 扫描完成</p>
+      <p>找到 ${result.total_found} 个视频文件</p>
+      <p>新增 ${result.new_added} 个</p>
+      ${result.series_detected.length > 0 ? `<p>检测到 ${result.series_detected.length} 个剧集</p>` : ''}
+      ${result.errors.length > 0 ? `<p style="color:var(--danger)">❌ ${result.errors.length} 个错误</p>` : ''}
+    `;
+
+    fetchVideos();
+    fetchTags();
+    fetchStats();
+    showToast(`扫描完成，新增 ${result.new_added} 个视频`);
+  } catch (e) {
+    document.getElementById('scan-status').textContent = '扫描失败';
+    showToast('扫描失败: ' + e, 'error');
+  } finally {
+    document.getElementById('btn-start-scan').disabled = false;
+  }
+}
+
+// ============================================
+// 标签管理对话框
+// ============================================
+function openTagModal() {
+  document.getElementById('tag-modal').classList.remove('hidden');
+  renderTagManageList();
+}
+
+function renderTagManageList() {
+  const list = document.getElementById('tag-manage-list');
+  list.innerHTML = state.tags.map(t => `
+    <div class="tag-manage-item">
+      <span class="tag-dot" style="background:${t.color}"></span>
+      <span class="tag-name">${t.name}</span>
+      <span class="tag-video-count">${t.video_count || 0} 个视频</span>
+      <button class="btn-delete-tag" data-tag-id="${t.id}">🗑</button>
+    </div>
+  `).join('');
+
+  list.querySelectorAll('.btn-delete-tag').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const tagId = parseInt(btn.dataset.tagId);
+      var ok = await showConfirm('删除标签', '确定删除此标签？');
+      if (ok) {
+        try {
+          await invoke('delete_tag', { tagId });
+          showToast('标签已删除');
+          fetchTags();
+          renderTagManageList();
+        } catch (e) {
+          showToast('删除标签失败: ' + e, 'error');
+        }
+      }
+    });
+  });
+}
+
+async function createNewTag() {
+  const name = document.getElementById('new-tag-name').value.trim();
+  const color = document.getElementById('new-tag-color').value;
+
+  if (!name) {
+    showToast('请输入标签名称', 'error');
+    return;
+  }
+
+  try {
+    await invoke('create_tag', { name, color });
+    document.getElementById('new-tag-name').value = '';
+    showToast('标签已创建');
+    fetchTags();
+    renderTagManageList();
+  } catch (e) {
+    showToast('创建标签失败: ' + e, 'error');
+  }
+}
+
+// ============================================
+// 导出数据
+// ============================================
+async function exportData() {
+  try {
+    const data = await invoke('export_json');
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const filename = `movieui-export-${new Date().toISOString().slice(0, 10)}.json`;
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    // 尝试获取下载路径
+    const downloadDir = window.electron?.app?.getPath?.('downloads') || '';
+    showToast(`✅ 导出完成！文件名: ${filename}（通常在浏览器下载文件夹中）`);
+  } catch (e) {
+    showToast('导出失败: ' + e, 'error');
+  }
+}
+
+// ============================================
+// 事件绑定
+// ============================================
+function bindEvents() {
+  // 导航
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      e.preventDefault();
+      state.currentView = item.dataset.view;
+      state.selectedTagIds = [];
+      state.searchQuery = '';
+      document.getElementById('search-input').value = '';
+      updateNavActive();
+      highlightSelectedTags();
+
+      if (state.currentView === 'history') {
+        fetchHistory();
+      } else {
+        fetchVideos();
+      }
+    });
+  });
+
+  // 搜索
+  let searchTimeout;
+  document.getElementById('search-input').addEventListener('input', (e) => {
+    clearTimeout(searchTimeout);
+    state.searchQuery = e.target.value;
+    searchTimeout = setTimeout(() => {
+      state.currentView = 'all';
+      updateNavActive();
+      fetchVideos();
+    }, 300);
+  });
+
+  // 排序
+  document.getElementById('sort-select').addEventListener('change', (e) => {
+    state.sortBy = e.target.value;
+    fetchVideos();
+  });
+
+  // 评分过滤
+  document.getElementById('rating-filter').addEventListener('change', (e) => {
+    state.ratingFilter = parseInt(e.target.value);
+    fetchVideos();
+  });
+
+  // 视图切换
+  document.getElementById('btn-grid').addEventListener('click', () => {
+    state.viewMode = 'grid';
+    document.getElementById('video-container').classList.remove('list-view');
+    document.getElementById('btn-grid').classList.add('active');
+    document.getElementById('btn-list').classList.remove('active');
+  });
+
+  document.getElementById('btn-list').addEventListener('click', () => {
+    state.viewMode = 'list';
+    document.getElementById('video-container').classList.add('list-view');
+    document.getElementById('btn-list').classList.add('active');
+    document.getElementById('btn-grid').classList.remove('active');
+  });
+
+  // 扫描
+  document.getElementById('btn-scan').addEventListener('click', openScanDialog);
+  document.getElementById('btn-browse-scan').onclick = async function() {
+    try {
+      var selected = await open({ directory: true, multiple: false });
+      if (selected) {
+        document.getElementById('scan-path').value = selected;
+      }
+    } catch (e) {
+      console.error('选择文件夹失败:', e);
+    }
+  };
+  document.getElementById('btn-start-scan').addEventListener('click', startScan);
+  document.getElementById('btn-cancel-scan').addEventListener('click', () => {
+    document.getElementById('scan-modal').classList.add('hidden');
+  });
+  document.getElementById('scan-close').addEventListener('click', () => {
+    document.getElementById('scan-modal').classList.add('hidden');
+  });
+
+  // 标签管理
+  document.getElementById('btn-add-tag').addEventListener('click', createNewTag);
+  document.getElementById('tag-close').addEventListener('click', () => {
+    document.getElementById('tag-modal').classList.add('hidden');
+  });
+
+  // 视频详情
+  document.getElementById('video-close').addEventListener('click', () => {
+    document.getElementById('video-modal').classList.add('hidden');
+  });
+
+  document.getElementById('btn-play').addEventListener('click', async () => {
+    const item = state.videos.find(v => (v.video || v).id === state.selectedVideoId);
+    if (item) {
+      const v = item.video || item;
+      try {
+        await invoke('open_file', { path: v.file_path });
+        await invoke('update_progress', { videoId: v.id, progress: 0 });
+      } catch (e) {
+        showToast('播放失败: ' + e, 'error');
+      }
+    }
+  });
+
+  document.getElementById('btn-open-folder').addEventListener('click', async () => {
+    const item = state.videos.find(v => (v.video || v).id === state.selectedVideoId);
+    if (item) {
+      const v = item.video || item;
+      try {
+        await invoke('open_folder', { path: v.file_path });
+      } catch (e) {
+        showToast('打开文件夹失败: ' + e, 'error');
+      }
+    }
+  });
+
+  document.getElementById('btn-fav-toggle').addEventListener('click', async () => {
+    try {
+      const result = await invoke('toggle_favorite', { videoId: state.selectedVideoId });
+      showToast(result ? '已收藏' : '已取消收藏');
+      fetchVideos();
+      fetchStats();
+      document.getElementById('video-modal').classList.add('hidden');
+    } catch (e) {
+      showToast('操作失败: ' + e, 'error');
+    }
+  });
+
+  document.getElementById('btn-delete-video').addEventListener('click', async () => {
+    var ok = await showConfirm('删除记录', '确定删除此视频记录？\n\n不会删除本地文件。');
+    if (ok) {
+      try {
+        await invoke('delete_video', { videoId: state.selectedVideoId });
+        showToast('已删除记录');
+        document.getElementById('video-modal').classList.add('hidden');
+        fetchVideos();
+        fetchStats();
+      } catch (e) {
+        showToast('删除失败: ' + e, 'error');
+      }
+    }
+  });
+
+  document.getElementById('btn-delete-file').addEventListener('click', async () => {
+    var item = state.videos.find(v => (v.video || v).id === state.selectedVideoId);
+    var filePath = item ? (item.video || item).file_path : '';
+    var ok = await showConfirm('⚠️ 删除文件', '确定删除此视频文件？\n\n文件: ' + filePath + '\n\n此操作不可撤销！');
+    if (ok) {
+      try {
+        var msg = await invoke('delete_video_with_file', { videoId: state.selectedVideoId });
+        showToast(msg);
+        document.getElementById('video-modal').classList.add('hidden');
+        fetchVideos();
+        fetchStats();
+      } catch (e) {
+        showToast('删除失败: ' + e, 'error');
+      }
+    }
+  });
+
+  // 导出
+  document.getElementById('btn-export').addEventListener('click', exportData);
+
+  // 导入
+  document.getElementById('btn-import').addEventListener('click', async function() {
+    try {
+      var filePath = await open({
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+      });
+      if (!filePath) return;
+
+      // 用 fetch 读取本地文件（Tauri 允许）
+      var response = await fetch('file:///' + filePath.replace(/\\/g, '/'));
+      var jsonStr = await response.text();
+
+      var result = await invoke('import_json', { jsonStr: jsonStr });
+      showToast('导入完成: 新增 ' + result.imported + ' 条, 跳过 ' + result.skipped + ' 条');
+      fetchVideos();
+      fetchTags();
+      fetchStats();
+    } catch (e) {
+      showToast('导入失败: ' + e, 'error');
+    }
+  });
+
+  // 切换已看过/未看过
+  document.getElementById('btn-watched-toggle').onclick = async function() {
+    try {
+      var newStatus = await invoke('toggle_watched', { videoId: state.selectedVideoId });
+      showToast('已标记为: ' + newStatus);
+      fetchVideos();
+      fetchTags();
+      document.getElementById('video-modal').classList.add('hidden');
+    } catch (e) {
+      showToast('操作失败: ' + e, 'error');
+    }
+  };
+
+  // 改名
+  document.getElementById('btn-rename').onclick = async function() {
+    var input = document.getElementById('detail-title-input');
+    var newTitle = input.value.trim();
+    if (!newTitle) { showToast('标题不能为空', 'error'); return; }
+    try {
+      await invoke('rename_video', { videoId: state.selectedVideoId, newTitle: newTitle });
+      showToast('已改名');
+      fetchVideos();
+      document.getElementById('video-modal').classList.add('hidden');
+    } catch (e) {
+      showToast('改名失败: ' + e, 'error');
+    }
+  };
+
+  // 屏蔽文件夹
+  var btnBlock = document.getElementById('btn-block');
+  if (btnBlock) {
+    btnBlock.onclick = function() {
+      var modal = document.getElementById('block-modal');
+      modal.classList.remove('hidden');
+      renderBlockList();
+    };
+  }
+
+  var blockClose = document.getElementById('block-close');
+  if (blockClose) {
+    blockClose.onclick = function() {
+      document.getElementById('block-modal').classList.add('hidden');
+    };
+  }
+
+  var btnBrowseBlock = document.getElementById('btn-browse-block');
+  if (btnBrowseBlock) {
+    btnBrowseBlock.onclick = async function() {
+      try {
+        var selected = await open({ directory: true, multiple: false });
+        if (selected) {
+          document.getElementById('new-block-path').value = selected;
+        }
+      } catch (e) {
+        console.error('选择文件夹失败:', e);
+      }
+    };
+  }
+
+  var btnAddBlock = document.getElementById('btn-add-block');
+  if (btnAddBlock) {
+    btnAddBlock.onclick = async function() {
+      var input = document.getElementById('new-block-path');
+      var path = input.value.trim();
+      if (path) {
+        addBlockedFolder(path);
+        input.value = '';
+        renderBlockList();
+        try {
+          var deleted = await invoke('delete_videos_by_folder', { folderPath: path });
+          showToast('已删除 ' + deleted + ' 条记录');
+        } catch (e) {
+          showToast('删除失败: ' + e, 'error');
+        }
+        fetchVideos();
+        fetchStats();
+      }
+    };
+  }
+
+  var btnClearBlocks = document.getElementById('btn-clear-blocks');
+  if (btnClearBlocks) {
+    btnClearBlocks.onclick = function() {
+      state.blockedFolders = [];
+      saveBlockedFolders();
+      renderBlockList();
+      showToast('已清除所有屏蔽');
+      fetchVideos();
+    };
+  }
+
+  // 屏蔽对话框的遮罩关闭
+  var blockOverlay = document.querySelector('#block-modal .modal-overlay');
+  if (blockOverlay) {
+    blockOverlay.onclick = function() {
+      document.getElementById('block-modal').classList.add('hidden');
+    };
+  }
+
+  // 关闭对话框（点击遮罩）
+  document.querySelectorAll('.modal-overlay').forEach(overlay => {
+    overlay.addEventListener('click', () => {
+      overlay.closest('.modal').classList.add('hidden');
+    });
+  });
+}
+
+// ============================================
+// 初始化
+// ============================================
+// ============================================
+// 自定义右键菜单
+// ============================================
+var contextMenuTarget = null;
+
+function initContextMenu() {
+  var menu = document.getElementById('context-menu');
+  var tagMenu = document.getElementById('tag-context-menu');
+  if (!menu) return;
+
+  // 全局拦截右键
+  window.addEventListener('contextmenu', function(e) {
+    e.preventDefault();
+    // 先隐藏所有菜单
+    menu.style.display = 'none';
+    if (tagMenu) tagMenu.style.display = 'none';
+
+    var card = e.target.closest('.video-card');
+    var tagItem = e.target.closest('.tag-nav-item');
+
+    if (card) {
+      // 视频卡片右键
+      contextMenuTarget = parseInt(card.dataset.id);
+      var vitem = state.videos.find(function(v) { return (v.video || v).id === contextMenuTarget; });
+      var v = vitem ? (vitem.video || vitem) : null;
+      var favItem = menu.querySelector('[data-action="fav"]');
+      if (favItem && v) {
+        favItem.textContent = v.is_favorite ? '★ 取消收藏' : '☆ 收藏';
+      }
+      menu.style.display = 'block';
+      menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
+      menu.style.top = Math.min(e.clientY, window.innerHeight - 250) + 'px';
+    } else if (tagMenu && (e.target.closest('#tag-list') || e.target.closest('.nav-section-title'))) {
+      // 标签区域右键（包括空白处）
+      tagContextTarget = tagItem ? parseInt(tagItem.dataset.tagId) : null;
+
+      // 显示/隐藏需要目标的菜单项
+      tagMenu.querySelectorAll('.tag-ctx-need-target').forEach(function(el) {
+        el.style.display = tagContextTarget ? '' : 'none';
+      });
+
+      tagMenu.style.display = 'block';
+      tagMenu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
+      tagMenu.style.top = Math.min(e.clientY, window.innerHeight - 200) + 'px';
+    }
+  }, true);
+
+  // 点击其他地方关闭所有菜单
+  document.addEventListener('click', function(e) {
+    if (!menu.contains(e.target)) menu.style.display = 'none';
+    if (tagMenu && !tagMenu.contains(e.target)) tagMenu.style.display = 'none';
+  });
+
+  // 菜单项点击
+  menu.querySelectorAll('.ctx-item').forEach(function(item) {
+    item.onmouseenter = function() { item.style.background = '#252540'; };
+    item.onmouseleave = function() { item.style.background = 'transparent'; };
+    item.onclick = async function() {
+      var action = item.dataset.action;
+      menu.style.display = 'none';
+      if (!contextMenuTarget) return;
+
+      switch (action) {
+        case 'play':
+          var v = state.videos.find(function(x) { return (x.video || x).id === contextMenuTarget; });
+          if (v) {
+            var vid = v.video || v;
+            await invoke('open_file', { path: vid.file_path });
+            await invoke('update_progress', { videoId: vid.id, progress: 0 });
+          }
+          break;
+        case 'rename':
+          openVideoDetail(contextMenuTarget);
+          setTimeout(function() {
+            var input = document.getElementById('detail-title-input');
+            if (input) input.focus();
+          }, 100);
+          break;
+        case 'tag':
+          openVideoDetail(contextMenuTarget);
+          setTimeout(function() { showTagSelector(contextMenuTarget); }, 100);
+          break;
+        case 'fav':
+          await invoke('toggle_favorite', { videoId: contextMenuTarget });
+          showToast('已切换收藏');
+          fetchVideos();
+          fetchStats();
+          break;
+        case 'watched':
+          var ws = await invoke('toggle_watched', { videoId: contextMenuTarget });
+          showToast('已标记: ' + ws);
+          fetchVideos();
+          fetchTags();
+          break;
+        case 'folder':
+          var v2 = state.videos.find(function(x) { return (x.video || x).id === contextMenuTarget; });
+          if (v2) await invoke('open_folder', { path: (v2.video || v2).file_path });
+          break;
+        case 'delete':
+          var delOk = await showConfirm('删除记录', '确定删除此记录？');
+          if (delOk) {
+            await invoke('delete_video', { videoId: contextMenuTarget });
+            showToast('已删除');
+            fetchVideos();
+            fetchStats();
+          }
+          break;
+      }
+    };
+  });
+
+  // 标签菜单项点击
+  if (tagMenu) {
+    tagMenu.querySelectorAll('.tag-ctx-item').forEach(function(item) {
+      item.onmouseenter = function() { item.style.background = '#252540'; };
+      item.onmouseleave = function() { item.style.background = 'transparent'; };
+      item.onclick = async function() {
+        var action = item.dataset.action;
+        tagMenu.style.display = 'none';
+        if (!tagContextTarget) return;
+
+        switch (action) {
+          case 'new-tag':
+            var newName = prompt('标签名:');
+            if (newName && newName.trim()) {
+              try {
+                await invoke('create_tag', { name: newName.trim(), color: '#6366f1' });
+                showToast('已创建');
+                fetchTags();
+              } catch (e) { showToast('失败: ' + e, 'error'); }
+            }
+            break;
+          case 'filter':
+            state.currentView = 'tag';
+            state.currentTagId = tagContextTarget;
+            updateNavActive();
+            fetchVideos();
+            break;
+          case 'rename-tag':
+            var tag = state.tags.find(function(t) { return t.id === tagContextTarget; });
+            if (tag) {
+              var newName = prompt('新标签名:', tag.name);
+              if (newName && newName.trim()) {
+                try {
+                  await invoke('delete_tag', { tagId: tagContextTarget });
+                  await invoke('create_tag', { name: newName.trim(), color: tag.color });
+                  showToast('已重命名');
+                  fetchTags();
+                } catch (e) { showToast('失败: ' + e, 'error'); }
+              }
+            }
+            break;
+          case 'change-color':
+            var tag2 = state.tags.find(function(t) { return t.id === tagContextTarget; });
+            if (tag2) {
+              var newColor = prompt('新颜色 (hex):', tag2.color);
+              if (newColor) {
+                try {
+                  await invoke('delete_tag', { tagId: tagContextTarget });
+                  await invoke('create_tag', { name: tag2.name, color: newColor });
+                  showToast('已改颜色');
+                  fetchTags();
+                } catch (e) { showToast('失败: ' + e, 'error'); }
+              }
+            }
+            break;
+          case 'delete-tag':
+            var tagDelOk = await showConfirm('删除标签', '确定删除此标签？');
+            if (tagDelOk) {
+              try {
+                await invoke('delete_tag', { tagId: tagContextTarget });
+                showToast('已删除');
+                fetchTags();
+              } catch (e) { showToast('失败: ' + e, 'error'); }
+            }
+            break;
+        }
+      };
+    });
+  }
+}
+
+// ============================================
+// 标签右键菜单
+// ============================================
+var tagContextTarget = null;
+
+async function init() {
+  initContextMenu();
+  bindEvents();
+  await fetchTags();
+  await fetchVideos();
+  await fetchStats();
+}
+
+// 启动
+document.addEventListener('DOMContentLoaded', init);

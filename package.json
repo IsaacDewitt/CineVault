@@ -1,0 +1,21 @@
+{
+  "name": "movie-ui",
+  "version": "1.0.0",
+  "description": "本地视频管理器",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2",
+    "esbuild": "^0.28.0",
+    "vite": "^8.0.16"
+  }
+}
