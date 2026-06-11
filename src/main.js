@@ -327,16 +327,23 @@ function renderVideoCard(videoWithTags) {
   var ratingStr = v.rating > 0 ? v.rating.toFixed(1) : '-';
   var sizeStr = formatSize(v.file_size || 0);
 
-  // 检查是否已看过/未看过，设置不同边框颜色
+  // 检查已看过/未看过状态，决定左边框颜色
   var borderColor = 'transparent';
   for (var i = 0; i < tags.length; i++) {
     if (tags[i].name === '已看过') { borderColor = '#10b981'; break; }
-    if (tags[i].name === '未看过') { borderColor = '#6b6b80'; break; }
+    if (tags[i].name === '未看过') { borderColor = '#4a4a5a'; break; }
+  }
+
+  // 标签色块（排除已看过/未看过，它们用左边框表示）
+  var tagsHtml = '';
+  for (var j = 0; j < tags.length; j++) {
+    if (tags[j].name === '已看过' || tags[j].name === '未看过') continue;
+    tagsHtml += '<span style="display:inline-block;background:' + tags[j].color + ';color:white;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:4px;">' + tags[j].name + '</span>';
   }
 
   return '<div class="video-card" data-id="' + v.id + '" style="border-left:3px solid ' + borderColor + ';">' +
     '<div class="video-card-title">' + title + seriesMark + favMark + '</div>' +
-    '<div class="video-card-meta">' + sizeStr + '  ·  ★ ' + ratingStr + '</div>' +
+    '<div class="video-card-meta">' + sizeStr + '  ·  ★ ' + ratingStr + tagsHtml + '</div>' +
   '</div>';
 }
 
