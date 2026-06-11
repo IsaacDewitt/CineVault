@@ -161,7 +161,7 @@ pub fn query_videos_paginated(
     let mut stmt = conn.prepare(&sql)?;
     let items = stmt.query_map(all_params.as_slice(), |row| {
         let video = row_to_video(row)?;
-        let tags_str: Option<String> = row.get(16)?;
+        let tags_str: Option<String> = row.get(17)?;
         let tags = parse_tags_string(tags_str);
         Ok(VideoWithTags { video, tags })
     })?.collect::<rusqlite::Result<Vec<_>>>()?;

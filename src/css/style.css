@@ -368,6 +368,13 @@ body {
   font-size: 11px;
 }
 
+.video-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
 .video-thumb {
   width: 100%;
   aspect-ratio: 16 / 9;
@@ -459,6 +466,13 @@ body {
   font-size: 11px;
   color: white;
   font-weight: 500;
+}
+
+.tag-chip-sm {
+  padding: 1px 6px;
+  font-size: 10px;
+  border-radius: 3px;
+  font-weight: 400;
 }
 
 /* List view styles */

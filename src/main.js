@@ -132,7 +132,7 @@ async function fetchVideos(append = false) {
       case 'series-episodes':
         // 显示某个剧集的剧集列表
         var episodes = await invoke('get_series_episodes', { series: state.currentSeries });
-        state.videos = (episodes || []).map(function(ep) { return { video: ep, tags: ep.tags || [] }; });
+        state.videos = episodes || [];
         state.totalCount = state.videos.length;
         state.hasMore = false;
         applyFilters();
@@ -321,29 +321,23 @@ function renderVideoCard(videoWithTags) {
   var v = videoWithTags.video || videoWithTags;
   var tags = videoWithTags.tags || [];
   var title = v.title || v.file_name || '(unknown)';
-  var isSeries = !!v.series_name;
   var favMark = v.is_favorite ? ' ★' : '';
-  var seriesMark = isSeries ? ' [' + v.series_name + ']' : '';
-  var ratingStr = v.rating > 0 ? v.rating.toFixed(1) : '-';
+  var ratingStr = (v.rating && v.rating > 0) ? v.rating.toFixed(1) : '-';
   var sizeStr = formatSize(v.file_size || 0);
 
-  // 检查已看过/未看过状态，决定左边框颜色
-  var borderColor = 'transparent';
-  for (var i = 0; i < tags.length; i++) {
-    if (tags[i].name === '已看过') { borderColor = '#10b981'; break; }
-    if (tags[i].name === '未看过') { borderColor = '#4a4a5a'; break; }
-  }
-
-  // 标签色块（排除已看过/未看过，它们用左边框表示）
+  // 所有标签色块
   var tagsHtml = '';
   for (var j = 0; j < tags.length; j++) {
-    if (tags[j].name === '已看过' || tags[j].name === '未看过') continue;
-    tagsHtml += '<span style="display:inline-block;background:' + tags[j].color + ';color:white;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:4px;">' + tags[j].name + '</span>';
+    var tc = tags[j].color || '#6366f1';
+    tagsHtml += '<span class="tag-chip tag-chip-sm" style="background:' + tc + ';">' + tags[j].name + '</span>';
   }
 
-  return '<div class="video-card" data-id="' + v.id + '" style="border-left:3px solid ' + borderColor + ';">' +
-    '<div class="video-card-title">' + title + seriesMark + favMark + '</div>' +
-    '<div class="video-card-meta">' + sizeStr + '  ·  ★ ' + ratingStr + tagsHtml + '</div>' +
+  var line2 = sizeStr + '  ·  ★ ' + ratingStr;
+
+  return '<div class="video-card" data-id="' + v.id + '">' +
+    '<div class="video-card-title">' + title + favMark + '</div>' +
+    '<div class="video-card-meta">' + line2 + '</div>' +
+    (tagsHtml ? '<div class="video-card-tags">' + tagsHtml + '</div>' : '') +
   '</div>';
 }
 
