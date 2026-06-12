@@ -844,6 +844,7 @@ async function startScan() {
   }
 
   const incremental = document.getElementById('incremental-scan').checked;
+  const defaultWatched = document.getElementById('scan-default-watched').checked;
 
   document.getElementById('scan-progress').classList.remove('hidden');
   document.getElementById('scan-result').classList.add('hidden');
@@ -858,9 +859,9 @@ async function startScan() {
     if (asSeries) {
       // 扫描为剧集：用文件夹名作为剧集名
       var folderName = path.split('\\').pop().split('/').pop();
-      result = await invoke('scan_series', { dirPath: path, seriesName: folderName, incremental });
+      result = await invoke('scan_series', { dirPath: path, seriesName: folderName, incremental, defaultWatched });
     } else {
-      result = await invoke('scan_videos', { dirPath: path, incremental });
+      result = await invoke('scan_videos', { dirPath: path, incremental, defaultWatched });
     }
 
     document.getElementById('progress-fill').style.width = '100%';
@@ -1138,15 +1139,15 @@ function bindEvents() {
   // 导入
   document.getElementById('btn-import').addEventListener('click', async function() {
     try {
-      var filePath = await open({
+      var fileContent = await open({
         multiple: false,
+        readFile: true,
         filters: [{ name: 'JSON', extensions: ['json'] }]
       });
-      if (!filePath) return;
+      if (!fileContent) return;
 
-      // 用 fetch 读取本地文件（Tauri 允许）
-      var response = await fetch('file:///' + filePath.replace(/\\/g, '/'));
-      var jsonStr = await response.text();
+      // readFile: true 直接返回 Uint8Array，解码为字符串
+      var jsonStr = new TextDecoder().decode(fileContent);
 
       var result = await invoke('import_json', { jsonStr: jsonStr });
       showToast('导入完成: 新增 ' + result.imported + ' 条, 跳过 ' + result.skipped + ' 条');
