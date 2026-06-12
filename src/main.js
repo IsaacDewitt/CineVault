@@ -1139,15 +1139,14 @@ function bindEvents() {
   // 导入
   document.getElementById('btn-import').addEventListener('click', async function() {
     try {
-      var fileContent = await open({
+      var filePath = await open({
         multiple: false,
-        readFile: true,
         filters: [{ name: 'JSON', extensions: ['json'] }]
       });
-      if (!fileContent) return;
+      if (!filePath) return;
 
-      // readFile: true 直接返回 Uint8Array，解码为字符串
-      var jsonStr = new TextDecoder().decode(fileContent);
+      // 通过 Rust 命令读取文件内容
+      var jsonStr = await invoke('read_text_file', { filePath: filePath });
 
       var result = await invoke('import_json', { jsonStr: jsonStr });
       showToast('导入完成: 新增 ' + result.imported + ' 条, 跳过 ' + result.skipped + ' 条');

@@ -82,7 +82,8 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
-            color TEXT NOT NULL DEFAULT '#6366f1'
+            color TEXT NOT NULL DEFAULT '#6366f1',
+            sort_order INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS video_tags (
@@ -112,6 +113,18 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
         INSERT OR IGNORE INTO tags (name, color) VALUES ('未看过', '#6b6b80');
         "
     )?;
+
+    // 数据库迁移：为 tags 表添加 sort_order 字段（如果不存在）
+    let has_sort_order: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tags') WHERE name = 'sort_order'",
+        [],
+        |row| row.get::<_, i64>(0)
+    ).unwrap_or(0) > 0;
+
+    if !has_sort_order {
+        conn.execute_batch("ALTER TABLE tags ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")?;
+    }
+
     Ok(())
 }
 
@@ -291,7 +304,7 @@ pub fn get_all_tags(conn: &Connection) -> Result<Vec<Tag>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT t.id, t.name, t.color, COUNT(vt.video_id) as video_count
          FROM tags t LEFT JOIN video_tags vt ON t.id = vt.tag_id
-         GROUP BY t.id ORDER BY t.name"
+         GROUP BY t.id ORDER BY t.sort_order, t.name"
     )?;
 
     let tags = stmt.query_map([], |row| {
@@ -324,6 +337,41 @@ pub fn create_tag(conn: &Connection, name: &str, color: &str) -> Result<Tag, App
 /// 删除标签
 pub fn delete_tag(conn: &Connection, tag_id: i64) -> Result<(), AppError> {
     conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
+    Ok(())
+}
+
+/// 更新标签（名称和/或颜色），保留 video_tags 关联
+pub fn update_tag(conn: &Connection, tag_id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), AppError> {
+    match (name, color) {
+        (Some(n), Some(c)) => {
+            conn.execute(
+                "UPDATE tags SET name = ?1, color = ?2 WHERE id = ?3",
+                params![n, c, tag_id],
+            )?;
+        }
+        (Some(n), None) => {
+            conn.execute(
+                "UPDATE tags SET name = ?1 WHERE id = ?2",
+                params![n, tag_id],
+            )?;
+        }
+        (None, Some(c)) => {
+            conn.execute(
+                "UPDATE tags SET color = ?1 WHERE id = ?2",
+                params![c, tag_id],
+            )?;
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+/// 批量更新标签排序
+pub fn update_tag_orders(conn: &Connection, orders: &[(i64, i64)]) -> Result<(), AppError> {
+    let mut stmt = conn.prepare("UPDATE tags SET sort_order = ?1 WHERE id = ?2")?;
+    for &(tag_id, sort_order) in orders {
+        stmt.execute(params![sort_order, tag_id])?;
+    }
     Ok(())
 }
 
@@ -377,6 +425,7 @@ pub fn upsert_video(
     series_name: Option<&str>,
     season: Option<i32>,
     episode: Option<i32>,
+    default_watched: bool,
 ) -> Result<UpsertResult, AppError> {
     let existing: Result<i64, _> = conn.query_row(
         "SELECT id FROM videos WHERE file_path = ?1",
@@ -402,11 +451,12 @@ pub fn upsert_video(
                 params![title, file_path, file_name, file_size, video_type, series_name, season, episode],
             )?;
             let new_id = conn.last_insert_rowid();
-        // 新视频默认标记"未看过"
+        // 根据参数决定默认标签
+        let default_tag = if default_watched { "已看过" } else { "未看过" };
         let _ = conn.execute(
             "INSERT OR IGNORE INTO video_tags (video_id, tag_id)
-             SELECT ?1, id FROM tags WHERE name = '未看过'",
-            rusqlite::params![new_id],
+             SELECT ?1, id FROM tags WHERE name = ?2",
+            rusqlite::params![new_id, default_tag],
         );
         Ok(UpsertResult::Inserted(new_id))
         }

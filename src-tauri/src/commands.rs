@@ -15,6 +15,7 @@ pub fn scan_videos(
     db: State<'_, DbConn>,
     dir_path: String,
     incremental: bool,
+    default_watched: bool,
 ) -> Result<ScanResult, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
 
@@ -72,6 +73,7 @@ pub fn scan_videos(
             info.series_name.as_deref(),
             info.season,
             info.episode,
+            default_watched,
         ) {
             Ok(result) => {
                 // #1: 区分插入和更新
@@ -142,10 +144,11 @@ pub fn get_videos_by_tag(db: State<'_, DbConn>, tag_id: i64, page: Option<i64>, 
 }
 
 /// 多标签筛选（AND 逻辑：视频必须同时拥有所有指定标签）
+/// video_type: 可选，限定视频类型（"movie" / "episode"）
 #[tauri::command]
-pub fn get_videos_by_tags(db: State<'_, DbConn>, tag_ids: Vec<i64>, page: Option<i64>, page_size: Option<i64>) -> Result<PaginatedVideos, String> {
+pub fn get_videos_by_tags(db: State<'_, DbConn>, tag_ids: Vec<i64>, video_type: Option<String>, page: Option<i64>, page_size: Option<i64>) -> Result<PaginatedVideos, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    if tag_ids.is_empty() {
+    if tag_ids.is_empty() && video_type.is_none() {
         return crate::db::get_all_videos(&conn, page.unwrap_or(0), page_size.unwrap_or(50)).map_err(|e| e.to_string());
     }
     // 构建 WHERE EXISTS 子查询：视频必须拥有所有指定标签
@@ -153,7 +156,11 @@ pub fn get_videos_by_tags(db: State<'_, DbConn>, tag_ids: Vec<i64>, page: Option
     for (i, _tag_id) in tag_ids.iter().enumerate() {
         conditions.push(format!("EXISTS (SELECT 1 FROM video_tags vt_{0} WHERE vt_{0}.video_id = v.id AND vt_{0}.tag_id = ?{0})", i + 1));
     }
-    let where_clause = format!("WHERE {}", conditions.join(" AND "));
+    // 可选：限定视频类型
+    if let Some(ref vtype) = video_type {
+        conditions.push(format!("v.video_type = '{}'", vtype));
+    }
+    let where_clause = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
     let params: Vec<Box<dyn rusqlite::types::ToSql>> = tag_ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     crate::db::query_videos_paginated(&conn, &where_clause, &param_refs, page.unwrap_or(0), page_size.unwrap_or(50)).map_err(|e| e.to_string())
@@ -222,6 +229,13 @@ pub fn delete_tag(db: State<'_, DbConn>, tag_id: i64) -> Result<(), String> {
     crate::db::delete_tag(&conn, tag_id).map_err(|e| e.to_string())
 }
 
+/// 更新标签（名称和/或颜色），保留关联
+#[tauri::command]
+pub fn update_tag(db: State<'_, DbConn>, tag_id: i64, name: Option<String>, color: Option<String>) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::update_tag(&conn, tag_id, name.as_deref(), color.as_deref()).map_err(|e| e.to_string())
+}
+
 /// 给视频添加标签
 #[tauri::command]
 pub fn add_video_tag(db: State<'_, DbConn>, video_id: i64, tag_id: i64) -> Result<(), String> {
@@ -234,6 +248,13 @@ pub fn add_video_tag(db: State<'_, DbConn>, video_id: i64, tag_id: i64) -> Resul
 pub fn remove_video_tag(db: State<'_, DbConn>, video_id: i64, tag_id: i64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::remove_tag_from_video(&conn, video_id, tag_id).map_err(|e| e.to_string())
+}
+
+/// 批量更新标签排序
+#[tauri::command]
+pub fn update_tag_orders(db: State<'_, DbConn>, orders: Vec<(i64, i64)>) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::update_tag_orders(&conn, &orders).map_err(|e| e.to_string())
 }
 
 /// 生成缩略图
@@ -298,6 +319,7 @@ pub fn import_json(db: State<'_, DbConn>, json_str: String) -> Result<ImportResu
             v.series_name.as_deref(),
             v.season,
             v.episode,
+            false, // 导入时保持原样，标签单独处理
         );
         match result {
             Ok(r) => {
@@ -347,6 +369,12 @@ pub fn import_json(db: State<'_, DbConn>, json_str: String) -> Result<ImportResu
 pub fn export_json(db: State<'_, DbConn>) -> Result<ExportData, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::export_data(&conn).map_err(|e| e.to_string())
+}
+
+/// 读取文本文件内容
+#[tauri::command]
+pub fn read_text_file(file_path: String) -> Result<String, String> {
+    std::fs::read_to_string(&file_path).map_err(|e| format!("读取文件失败: {}", e))
 }
 
 /// 切换已看过/未看过状态
@@ -399,6 +427,7 @@ pub fn scan_series(
     dir_path: String,
     series_name: String,
     incremental: bool,
+    default_watched: bool,
 ) -> Result<ScanResult, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     scanner::clear_dir_cache();
@@ -447,6 +476,7 @@ pub fn scan_series(
             info.series_name.as_deref(),
             info.season.or(Some(1)),
             info.episode,
+            default_watched,
         ) {
             Ok(result) => {
                 if result.is_inserted() { new_added += 1; } else { updated += 1; }
