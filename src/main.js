@@ -10,6 +10,7 @@ const state = {
   videos: [],
   tags: [],
   currentView: 'all',
+  previousView: 'all',
   selectedTagIds: [],
   viewMode: 'grid',
   sortBy: 'updated',
@@ -22,6 +23,15 @@ const state = {
   loading: false,
   seriesList: [],
   currentSeries: '',
+};
+
+// 拖拽状态
+const dragState = {
+  dragging: false,
+  dragItem: null,
+  startY: 0,
+  startIndex: -1,
+  placeholder: null,
 };
 
 // ============================================
@@ -123,8 +133,14 @@ async function fetchVideos(append = false) {
         state.loading = false;
         return;
       case 'tag':
+        // 根据之前的视图限定视频类型
+        var vtype = null;
+        if (state.previousView === 'all') vtype = 'movie';
+        else if (state.previousView === 'series') vtype = 'episode';
         if (state.selectedTagIds.length > 0) {
-          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, page, pageSize: PAGE_SIZE });
+          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, videoType: vtype, page, pageSize: PAGE_SIZE });
+        } else if (vtype) {
+          result = await invoke('get_videos_by_tags', { tagIds: [], videoType: vtype, page, pageSize: PAGE_SIZE });
         } else {
           result = await invoke('get_movies', { page, pageSize: PAGE_SIZE });
         }
@@ -387,6 +403,7 @@ function renderTags() {
   const tagList = document.getElementById('tag-list');
   tagList.innerHTML = state.tags.map(t => `
     <div class="tag-nav-item" data-tag-id="${t.id}">
+      <span class="tag-drag-handle" title="拖拽排序">⠿</span>
       <span class="tag-dot" style="background:${t.color}"></span>
       <span>${t.name}</span>
       <span class="tag-count">${t.video_count || 0}</span>
@@ -394,38 +411,210 @@ function renderTags() {
   `).join('');
 
   tagList.querySelectorAll('.tag-nav-item').forEach(item => {
-    item.addEventListener('click', () => {
+    // 点击事件（默认多选，互斥标签例外）
+    item.addEventListener('click', (e) => {
+      // 如果点击的是拖拽手柄，不触发选中
+      if (e.target.classList.contains('tag-drag-handle')) return;
+
       const tagId = parseInt(item.dataset.tagId);
+      const tagName = item.querySelector('span:nth-child(3)').textContent.trim();
+
+      // 首次切到标签视图时，记住之前的视图（用于限定视频类型）
+      if (state.currentView !== 'tag') {
+        state.previousView = state.currentView;
+      }
       state.currentView = 'tag';
 
-      // 多选：Ctrl+点击切换，普通点击替换
-      if (window.event && window.event.ctrlKey) {
-        var idx = state.selectedTagIds.indexOf(tagId);
-        if (idx >= 0) {
-          state.selectedTagIds.splice(idx, 1);
-        } else {
-          state.selectedTagIds.push(tagId);
-        }
+      var idx = state.selectedTagIds.indexOf(tagId);
+      if (idx >= 0) {
+        // 已选中 → 取消选中
+        state.selectedTagIds.splice(idx, 1);
       } else {
-        // 单击：如果已选中则取消，否则选中
-        var idx2 = state.selectedTagIds.indexOf(tagId);
-        if (idx2 >= 0) {
-          state.selectedTagIds.splice(idx2, 1);
-        } else {
-          state.selectedTagIds = [tagId];
+        // 未选中 → 加入选中
+        // 互斥规则：已看过 ↔ 未看过 不能同时选中
+        if (tagName === '已看过') {
+          var unwatchedTag = state.tags.find(t => t.name === '未看过');
+          if (unwatchedTag) {
+            var ui = state.selectedTagIds.indexOf(unwatchedTag.id);
+            if (ui >= 0) state.selectedTagIds.splice(ui, 1);
+          }
+        } else if (tagName === '未看过') {
+          var watchedTag = state.tags.find(t => t.name === '已看过');
+          if (watchedTag) {
+            var wi = state.selectedTagIds.indexOf(watchedTag.id);
+            if (wi >= 0) state.selectedTagIds.splice(wi, 1);
+          }
         }
+        state.selectedTagIds.push(tagId);
       }
 
-      // 如果全部取消选中，回到全部视图
+      // 如果全部取消选中，回到之前的视图
       if (state.selectedTagIds.length === 0) {
-        state.currentView = 'all';
+        state.currentView = state.previousView;
       }
 
       updateNavActive();
       highlightSelectedTags();
       fetchVideos();
     });
+
+    // 拖拽手柄事件
+    const handle = item.querySelector('.tag-drag-handle');
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      startDrag(item, e);
+    });
   });
+}
+
+// ============================================
+// 拖拽排序
+// ============================================
+function startDrag(item, e) {
+  const tagList = document.getElementById('tag-list');
+  const rect = item.getBoundingClientRect();
+
+  dragState.dragging = true;
+  dragState.dragItem = item;
+  dragState.startY = e.clientY;
+  dragState.itemTop = rect.top;
+  dragState.itemHeight = rect.height;
+  dragState.targetId = null;  // 记录目标位置的标签 ID
+
+  // 设置元素为固定定位，跟随鼠标
+  item.style.position = 'fixed';
+  item.style.top = rect.top + 'px';
+  item.style.left = rect.left + 'px';
+  item.style.width = rect.width + 'px';
+  item.style.zIndex = '1000';
+  item.style.pointerEvents = 'none';
+  item.classList.add('dragging');
+
+  // 绑定全局事件
+  document.addEventListener('mousemove', onDragMove);
+  document.addEventListener('mouseup', onDragEnd);
+}
+
+function onDragMove(e) {
+  if (!dragState.dragging) return;
+
+  const dragItem = dragState.dragItem;
+  const tagList = document.getElementById('tag-list');
+
+  // 更新拖拽元素位置
+  const deltaY = e.clientY - dragState.startY;
+  dragItem.style.top = (dragState.itemTop + deltaY) + 'px';
+
+  // 找到最近的放置位置
+  const items = Array.from(tagList.querySelectorAll('.tag-nav-item:not(.dragging)'));
+  let closestItem = null;
+  let closestDistance = Infinity;
+
+  items.forEach(item => {
+    const rect = item.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+    const distance = Math.abs(e.clientY - centerY);
+
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      closestItem = item;
+    }
+  });
+
+  if (closestItem) {
+    const closestRect = closestItem.getBoundingClientRect();
+    const closestCenter = closestRect.top + closestRect.height / 2;
+
+    // 判断目标位置
+    let targetId;
+    if (e.clientY < closestCenter) {
+      targetId = closestItem.dataset.tagId;
+    } else {
+      // 如果是后面，取下一个元素的 ID（如果没有下一个，用 'end'）
+      const next = closestItem.nextElementSibling;
+      if (next && next.classList.contains('tag-nav-item') && !next.classList.contains('dragging')) {
+        targetId = next.dataset.tagId;
+      } else {
+        targetId = 'end';
+      }
+    }
+
+    // 只有目标位置变化时才更新视觉提示
+    if (targetId !== dragState.targetId) {
+      // 移除之前的提示
+      tagList.querySelectorAll('.drag-before').forEach(el => el.classList.remove('drag-before'));
+      tagList.querySelectorAll('.drag-after').forEach(el => el.classList.remove('drag-after'));
+
+      // 添加新的提示
+      if (targetId === 'end') {
+        const lastItem = items[items.length - 1];
+        if (lastItem) lastItem.classList.add('drag-after');
+      } else {
+        const targetEl = tagList.querySelector(`[data-tag-id="${targetId}"]`);
+        if (targetEl) targetEl.classList.add('drag-before');
+      }
+
+      dragState.targetId = targetId;
+    }
+  }
+}
+
+async function onDragEnd(e) {
+  if (!dragState.dragging) return;
+
+  const tagList = document.getElementById('tag-list');
+  const dragItem = dragState.dragItem;
+  const targetId = dragState.targetId;
+
+  // 清除所有内联样式
+  dragItem.removeAttribute('style');
+  dragItem.classList.remove('dragging');
+
+  // 根据 targetId 将元素插入到正确位置
+  if (targetId) {
+    if (targetId === 'end') {
+      tagList.appendChild(dragItem);
+    } else {
+      const targetEl = tagList.querySelector(`[data-tag-id="${targetId}"]`);
+      if (targetEl) {
+        tagList.insertBefore(dragItem, targetEl);
+      }
+    }
+  }
+  // 如果 targetId 为 null，说明没有移动，元素回到原位
+
+  // 插入完成后，清除所有高亮边框（必须在插入后清除，否则可能漏掉）
+  tagList.querySelectorAll('.drag-before').forEach(el => el.classList.remove('drag-before'));
+  tagList.querySelectorAll('.drag-after').forEach(el => el.classList.remove('drag-after'));
+
+  // 获取新的 DOM 顺序，更新 state.tags
+  const newOrder = Array.from(tagList.querySelectorAll('.tag-nav-item')).map(item => {
+    return parseInt(item.dataset.tagId);
+  });
+
+  state.tags.sort((a, b) => newOrder.indexOf(a.id) - newOrder.indexOf(b.id));
+
+  // 保存新顺序到后端
+  await saveTagOrder();
+
+  // 清理状态
+  dragState.dragging = false;
+  dragState.dragItem = null;
+  dragState.targetId = null;
+
+  // 移除全局事件
+  document.removeEventListener('mousemove', onDragMove);
+  document.removeEventListener('mouseup', onDragEnd);
+}
+
+async function saveTagOrder() {
+  const orders = state.tags.map((tag, index) => [tag.id, index]);
+  try {
+    await invoke('update_tag_orders', { orders });
+  } catch (e) {
+    console.error('保存标签顺序失败:', e);
+  }
 }
 
 function highlightSelectedTags() {
@@ -517,8 +706,8 @@ function openVideoDetail(videoId) {
       try {
         await invoke('remove_video_tag', { videoId: v.id, tagId });
         showToast('标签已移除');
-        fetchVideos();
-        fetchTags();
+        await fetchVideos();
+        await fetchTags();
         openVideoDetail(videoId);
       } catch (e) {
         showToast('移除标签失败: ' + e, 'error');
@@ -605,8 +794,8 @@ function showTagSelector(videoId) {
         await invoke('add_video_tag', { videoId: videoId, tagId: tagId });
         showToast('标签已添加');
         selector.remove();
-        fetchVideos();
-        fetchTags();
+        await fetchVideos();
+        await fetchTags();
         openVideoDetail(videoId);
       } catch (e) {
         showToast('添加失败: ' + e, 'error');
@@ -627,8 +816,8 @@ function showTagSelector(videoId) {
         await invoke('add_video_tag', { videoId: videoId, tagId: newTag.id });
         showToast('标签已创建并添加');
         selector.remove();
-        fetchVideos();
-        fetchTags();
+        await fetchVideos();
+        await fetchTags();
         openVideoDetail(videoId);
       } catch (e) {
         showToast('创建失败: ' + e, 'error');
@@ -788,6 +977,7 @@ function bindEvents() {
   document.querySelectorAll('.nav-item').forEach(item => {
     item.addEventListener('click', (e) => {
       e.preventDefault();
+      state.previousView = item.dataset.view;
       state.currentView = item.dataset.view;
       state.selectedTagIds = [];
       state.searchQuery = '';
@@ -1154,11 +1344,42 @@ function initContextMenu() {
           case 'new-tag':
             var newName = prompt('标签名:');
             if (newName && newName.trim()) {
-              try {
-                await invoke('create_tag', { name: newName.trim(), color: '#6366f1' });
-                showToast('已创建');
-                fetchTags();
-              } catch (e) { showToast('失败: ' + e, 'error'); }
+              // 弹出带确认按钮的颜色选择弹窗
+              var overlay2 = document.createElement('div');
+              overlay2.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+              var popup2 = document.createElement('div');
+              popup2.style.cssText = 'background:#1e1e3a;border:1px solid #2d2d4a;border-radius:12px;padding:20px;min-width:240px;text-align:center;';
+              popup2.innerHTML =
+                '<div style="color:#a0a0b8;font-size:13px;margin-bottom:12px;">选择标签颜色</div>' +
+                '<input type="color" id="new-tag-color-picker" value="#6366f1" style="width:100%;height:120px;border:1px solid #2d2d4a;border-radius:8px;cursor:pointer;background:transparent;padding:2px;" />' +
+                '<div id="new-tag-color-hex" style="color:#e8e8e8;font-size:13px;margin-top:8px;font-family:monospace;">#6366f1</div>' +
+                '<div style="display:flex;gap:8px;margin-top:14px;justify-content:center;">' +
+                  '<button id="new-tag-color-cancel" style="padding:8px 20px;background:#252540;color:#a0a0b8;border:1px solid #2d2d4a;border-radius:6px;cursor:pointer;font-size:13px;">取消</button>' +
+                  '<button id="new-tag-color-confirm" style="padding:8px 20px;background:#6366f1;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;">确认</button>' +
+                '</div>';
+              overlay2.appendChild(popup2);
+              document.body.appendChild(overlay2);
+
+              var pickerInput2 = popup2.querySelector('#new-tag-color-picker');
+              var hexLabel2 = popup2.querySelector('#new-tag-color-hex');
+              pickerInput2.addEventListener('input', function() {
+                hexLabel2.textContent = pickerInput2.value;
+              });
+              popup2.querySelector('#new-tag-color-cancel').addEventListener('click', function() {
+                document.body.removeChild(overlay2);
+              });
+              overlay2.addEventListener('click', function(e) {
+                if (e.target === overlay2) document.body.removeChild(overlay2);
+              });
+              popup2.querySelector('#new-tag-color-confirm').addEventListener('click', async function() {
+                var pickedColor = pickerInput2.value;
+                document.body.removeChild(overlay2);
+                try {
+                  await invoke('create_tag', { name: newName.trim(), color: pickedColor });
+                  showToast('已创建');
+                  fetchTags();
+                } catch (e) { showToast('失败: ' + e, 'error'); }
+              });
             }
             break;
           case 'filter':
@@ -1171,10 +1392,9 @@ function initContextMenu() {
             var tag = state.tags.find(function(t) { return t.id === tagContextTarget; });
             if (tag) {
               var newName = prompt('新标签名:', tag.name);
-              if (newName && newName.trim()) {
+              if (newName && newName.trim() && newName.trim() !== tag.name) {
                 try {
-                  await invoke('delete_tag', { tagId: tagContextTarget });
-                  await invoke('create_tag', { name: newName.trim(), color: tag.color });
+                  await invoke('update_tag', { tagId: tagContextTarget, name: newName.trim(), color: null });
                   showToast('已重命名');
                   fetchTags();
                 } catch (e) { showToast('失败: ' + e, 'error'); }
@@ -1184,15 +1404,46 @@ function initContextMenu() {
           case 'change-color':
             var tag2 = state.tags.find(function(t) { return t.id === tagContextTarget; });
             if (tag2) {
-              var newColor = prompt('新颜色 (hex):', tag2.color);
-              if (newColor) {
+              // 创建带确认按钮的颜色选择弹窗
+              var overlay = document.createElement('div');
+              overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+              var popup = document.createElement('div');
+              popup.style.cssText = 'background:#1e1e3a;border:1px solid #2d2d4a;border-radius:12px;padding:20px;min-width:240px;text-align:center;';
+              popup.innerHTML =
+                '<div style="color:#a0a0b8;font-size:13px;margin-bottom:12px;">选择标签颜色</div>' +
+                '<input type="color" id="color-picker-popup" value="' + tag2.color + '" style="width:100%;height:120px;border:1px solid #2d2d4a;border-radius:8px;cursor:pointer;background:transparent;padding:2px;" />' +
+                '<div id="color-picker-hex" style="color:#e8e8e8;font-size:13px;margin-top:8px;font-family:monospace;">' + tag2.color + '</div>' +
+                '<div style="display:flex;gap:8px;margin-top:14px;justify-content:center;">' +
+                  '<button id="color-picker-cancel" style="padding:8px 20px;background:#252540;color:#a0a0b8;border:1px solid #2d2d4a;border-radius:6px;cursor:pointer;font-size:13px;">取消</button>' +
+                  '<button id="color-picker-confirm" style="padding:8px 20px;background:#6366f1;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;">确认</button>' +
+                '</div>';
+              overlay.appendChild(popup);
+              document.body.appendChild(overlay);
+
+              var pickerInput = popup.querySelector('#color-picker-popup');
+              var hexLabel = popup.querySelector('#color-picker-hex');
+              // 实时显示色号
+              pickerInput.addEventListener('input', function() {
+                hexLabel.textContent = pickerInput.value;
+              });
+              // 取消
+              popup.querySelector('#color-picker-cancel').addEventListener('click', function() {
+                document.body.removeChild(overlay);
+              });
+              // 点遮罩也取消
+              overlay.addEventListener('click', function(e) {
+                if (e.target === overlay) document.body.removeChild(overlay);
+              });
+              // 确认
+              popup.querySelector('#color-picker-confirm').addEventListener('click', async function() {
+                var newColor = pickerInput.value;
+                document.body.removeChild(overlay);
                 try {
-                  await invoke('delete_tag', { tagId: tagContextTarget });
-                  await invoke('create_tag', { name: tag2.name, color: newColor });
+                  await invoke('update_tag', { tagId: tagContextTarget, name: null, color: newColor });
                   showToast('已改颜色');
                   fetchTags();
                 } catch (e) { showToast('失败: ' + e, 'error'); }
-              }
+              });
             }
             break;
           case 'delete-tag':
