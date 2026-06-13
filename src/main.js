@@ -138,6 +138,12 @@ async function fetchVideos(append = false) {
         } else {
           // 剧集视图：显示剧集概览，不是单个视频
           var seriesList = await invoke('get_series_overview');
+          if (state.searchQuery) {
+            var q = state.searchQuery.toLowerCase();
+            seriesList = (seriesList || []).filter(function(s) {
+              return s.name && s.name.toLowerCase().indexOf(q) !== -1;
+            });
+          }
           state.videos = [];
           state.seriesList = seriesList || [];
           state.totalCount = state.seriesList.length;
@@ -152,6 +158,16 @@ async function fetchVideos(append = false) {
       case 'series-episodes':
         // 显示某个剧集的剧集列表
         var episodes = await invoke('get_series_episodes', { series: state.currentSeries });
+        if (state.searchQuery) {
+          var q = state.searchQuery.toLowerCase();
+          episodes = (episodes || []).filter(function(ep) {
+            var v = ep.video || ep;
+            var title = (v.title || '').toLowerCase();
+            var fileName = (v.file_name || '').toLowerCase();
+            var seriesName = (v.series_name || '').toLowerCase();
+            return title.indexOf(q) !== -1 || fileName.indexOf(q) !== -1 || seriesName.indexOf(q) !== -1;
+          });
+        }
         state.videos = episodes || [];
         state.totalCount = state.videos.length;
         state.hasMore = false;
@@ -315,12 +331,13 @@ function renderSeriesOverview() {
   var html = '';
   for (var i = 0; i < state.seriesList.length; i++) {
     var s = state.seriesList[i];
+    var displayName = s.name && s.name.trim() !== '' ? s.name : '未命名剧集';
     var pct = Math.round(s.progress * 100);
     var ratingStr = s.rating > 0 ? s.rating.toFixed(1) : '-';
     var sizeStr = formatSize(s.total_size);
 
-    html += '<div class="video-card" data-series="' + s.name + '" style="border-left:3px solid ' + (pct === 100 ? '#10b981' : '#6366f1') + ';">' +
-      '<div class="video-card-title">' + s.name + '</div>' +
+    html += '<div class="video-card" data-series="' + escapeHtml(s.name) + '" style="border-left:3px solid ' + (pct === 100 ? '#10b981' : '#6366f1') + ';">' +
+      '<div class="video-card-title">' + escapeHtml(displayName) + '</div>' +
       '<div class="video-card-meta">' + s.watched_episodes + '/' + s.total_episodes + ' 集  ·  ' + sizeStr + '  ·  ★ ' + ratingStr + '</div>' +
       '<div style="margin-top:6px;background:#252540;border-radius:4px;height:6px;overflow:hidden;">' +
         '<div style="height:100%;width:' + pct + '%;background:' + (pct === 100 ? '#10b981' : '#6366f1') + ';border-radius:4px;transition:width 0.3s;"></div>' +
@@ -1065,8 +1082,11 @@ function bindEvents() {
     clearTimeout(searchTimeout);
     state.searchQuery = e.target.value;
     searchTimeout = setTimeout(() => {
-      state.currentView = 'all';
-      updateNavActive();
+      // 在剧集详情页搜索时，回到剧集概览进行搜索
+      if (state.currentView === 'series-episodes') {
+        state.currentView = 'series';
+        updateNavActive();
+      }
       fetchVideos();
     }, 300);
   });
@@ -1288,6 +1308,8 @@ function bindEvents() {
 // 自定义右键菜单
 // ============================================
 var contextMenuTarget = null;
+var contextMenuIsSeries = false;  // 是否是剧集卡片
+var contextMenuSeriesName = '';   // 剧集名称
 
 function initContextMenu() {
   var menu = document.getElementById('context-menu');
@@ -1305,14 +1327,41 @@ function initContextMenu() {
     var tagItem = e.target.closest('.tag-nav-item');
 
     if (card) {
-      // 视频卡片右键
-      contextMenuTarget = parseInt(card.dataset.id);
+      // 判断是剧集卡片还是视频卡片（使用 hasAttribute 判断，因为空字符串也是有效值）
+      if (card.hasAttribute('data-series')) {
+        // 剧集概览卡片
+        contextMenuIsSeries = true;
+        contextMenuSeriesName = card.dataset.series || '';
+        contextMenuTarget = null;
+      } else {
+        // 普通视频卡片
+        contextMenuIsSeries = false;
+        contextMenuSeriesName = '';
+        contextMenuTarget = parseInt(card.dataset.id);
+      }
+
       var vitem = state.videos.find(function(v) { return (v.video || v).id === contextMenuTarget; });
       var v = vitem ? (vitem.video || vitem) : null;
       var favItem = menu.querySelector('[data-action="fav"]');
       if (favItem && v) {
         favItem.textContent = v.is_favorite ? '★ 取消收藏' : '☆ 收藏';
       }
+
+      // 剧集卡片时隐藏某些菜单项
+      menu.querySelectorAll('.ctx-item').forEach(function(item) {
+        var action = item.dataset.action;
+        if (contextMenuIsSeries) {
+          // 剧集卡片只显示：改名、删除
+          if (action === 'rename' || action === 'delete') {
+            item.style.display = '';
+          } else {
+            item.style.display = 'none';
+          }
+        } else {
+          item.style.display = '';
+        }
+      });
+
       menu.style.display = 'block';
       menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
       menu.style.top = Math.min(e.clientY, window.innerHeight - 250) + 'px';
@@ -1344,6 +1393,40 @@ function initContextMenu() {
     item.onclick = async function() {
       var action = item.dataset.action;
       menu.style.display = 'none';
+
+      // 剧集卡片的处理
+      if (contextMenuIsSeries) {
+        if (action === 'rename') {
+          var displayName = contextMenuSeriesName && contextMenuSeriesName.trim() !== '' ? contextMenuSeriesName : '未命名剧集';
+          var newName = prompt('新剧集名:', displayName);
+          if (newName && newName.trim() && newName.trim() !== displayName) {
+            try {
+              await invoke('rename_series', { oldName: contextMenuSeriesName, newName: newName.trim() });
+              showToast('剧集已改名');
+              fetchVideos();
+              fetchStats();
+            } catch (e) {
+              showToast('改名失败: ' + e, 'error');
+            }
+          }
+        } else if (action === 'delete') {
+          var displayName2 = contextMenuSeriesName && contextMenuSeriesName.trim() !== '' ? contextMenuSeriesName : '未命名剧集';
+          var delOk = await showConfirm('删除剧集', '确定删除「' + displayName2 + '」的所有记录？\n\n不会删除本地文件。');
+          if (delOk) {
+            try {
+              await invoke('delete_series', { seriesName: contextMenuSeriesName });
+              showToast('剧集已删除');
+              fetchVideos();
+              fetchStats();
+            } catch (e) {
+              showToast('删除失败: ' + e, 'error');
+            }
+          }
+        }
+        return;
+      }
+
+      // 普通视频卡片的处理
       if (!contextMenuTarget) return;
 
       switch (action) {
@@ -1383,8 +1466,8 @@ function initContextMenu() {
           if (v2) await invoke('open_folder', { path: (v2.video || v2).file_path });
           break;
         case 'delete':
-          var delOk = await showConfirm('删除记录', '确定删除此记录？');
-          if (delOk) {
+          var delOk2 = await showConfirm('删除记录', '确定删除此记录？');
+          if (delOk2) {
             await invoke('delete_video', { videoId: contextMenuTarget });
             showToast('已删除');
             fetchVideos();
