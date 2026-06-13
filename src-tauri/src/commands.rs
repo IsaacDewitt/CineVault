@@ -543,11 +543,41 @@ pub fn rename_video(db: State<'_, DbConn>, video_id: i64, new_title: String) -> 
     Ok(())
 }
 
+/// 修改剧集名称（批量更新该剧集下所有视频的 series_name）
+#[tauri::command]
+pub fn rename_series(db: State<'_, DbConn>, old_name: String, new_name: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    // 处理空字符串的情况：old_name 为空时，匹配空字符串或 NULL
+    if old_name.is_empty() {
+        conn.execute(
+            "UPDATE videos SET series_name = ?1, updated_at = datetime('now','localtime') WHERE (series_name = '' OR series_name IS NULL) AND video_type = 'episode'",
+            rusqlite::params![new_name],
+        ).map_err(|e| AppError::db(e.to_string()))?;
+    } else {
+        conn.execute(
+            "UPDATE videos SET series_name = ?1, updated_at = datetime('now','localtime') WHERE series_name = ?2",
+            rusqlite::params![new_name, old_name],
+        ).map_err(|e| AppError::db(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// 删除视频记录
 #[tauri::command]
 pub fn delete_video(db: State<'_, DbConn>, video_id: i64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())
+}
+
+/// 删除整个剧集（删除该剧集下的所有视频记录）
+#[tauri::command]
+pub fn delete_series(db: State<'_, DbConn>, series_name: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM videos WHERE series_name = ?1",
+        rusqlite::params![series_name],
+    ).map_err(|e| AppError::db(e.to_string()))?;
+    Ok(())
 }
 
 /// 删除视频文件 + 数据库记录
