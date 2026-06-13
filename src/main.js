@@ -472,8 +472,10 @@ function renderTags() {
 // 拖拽排序
 // ============================================
 function startDrag(item, e) {
-  const tagList = document.getElementById('tag-list');
-  const rect = item.getBoundingClientRect();
+  if (!item || !e) return;
+  var tagList = document.getElementById('tag-list');
+  if (!tagList) return;
+  var rect = item.getBoundingClientRect();
 
   dragState.dragging = true;
   dragState.dragItem = item;
@@ -497,17 +499,18 @@ function startDrag(item, e) {
 }
 
 function onDragMove(e) {
-  if (!dragState.dragging) return;
+  if (!dragState.dragging || !dragState.dragItem) return;
 
-  const dragItem = dragState.dragItem;
-  const tagList = document.getElementById('tag-list');
+  var dragItem = dragState.dragItem;
+  var tagList = document.getElementById('tag-list');
+  if (!tagList) return;
 
   // 更新拖拽元素位置
-  const deltaY = e.clientY - dragState.startY;
+  var deltaY = e.clientY - dragState.startY;
   dragItem.style.top = (dragState.itemTop + deltaY) + 'px';
 
   // 找到最近的放置位置
-  const items = Array.from(tagList.querySelectorAll('.tag-nav-item:not(.dragging)'));
+  var items = Array.from(tagList.querySelectorAll('.tag-nav-item:not(.dragging)'));
   let closestItem = null;
   let closestDistance = Infinity;
 
@@ -543,8 +546,7 @@ function onDragMove(e) {
     // 只有目标位置变化时才更新视觉提示
     if (targetId !== dragState.targetId) {
       // 移除之前的提示
-      tagList.querySelectorAll('.drag-before').forEach(el => el.classList.remove('drag-before'));
-      tagList.querySelectorAll('.drag-after').forEach(el => el.classList.remove('drag-after'));
+      clearDragIndicators();
 
       // 添加新的提示
       if (targetId === 'end') {
@@ -563,49 +565,67 @@ function onDragMove(e) {
 async function onDragEnd(e) {
   if (!dragState.dragging) return;
 
-  const tagList = document.getElementById('tag-list');
-  const dragItem = dragState.dragItem;
-  const targetId = dragState.targetId;
-
-  // 清除所有内联样式
-  dragItem.removeAttribute('style');
-  dragItem.classList.remove('dragging');
-
-  // 根据 targetId 将元素插入到正确位置
-  if (targetId) {
-    if (targetId === 'end') {
-      tagList.appendChild(dragItem);
-    } else {
-      const targetEl = tagList.querySelector(`[data-tag-id="${targetId}"]`);
-      if (targetEl) {
-        tagList.insertBefore(dragItem, targetEl);
-      }
-    }
-  }
-  // 如果 targetId 为 null，说明没有移动，元素回到原位
-
-  // 插入完成后，清除所有高亮边框（必须在插入后清除，否则可能漏掉）
-  tagList.querySelectorAll('.drag-before').forEach(el => el.classList.remove('drag-before'));
-  tagList.querySelectorAll('.drag-after').forEach(el => el.classList.remove('drag-after'));
-
-  // 获取新的 DOM 顺序，更新 state.tags
-  const newOrder = Array.from(tagList.querySelectorAll('.tag-nav-item')).map(item => {
-    return parseInt(item.dataset.tagId);
-  });
-
-  state.tags.sort((a, b) => newOrder.indexOf(a.id) - newOrder.indexOf(b.id));
-
-  // 保存新顺序到后端
-  await saveTagOrder();
-
-  // 清理状态
-  dragState.dragging = false;
-  dragState.dragItem = null;
-  dragState.targetId = null;
-
-  // 移除全局事件
+  // 移除全局事件（先移除，防止重入）
   document.removeEventListener('mousemove', onDragMove);
   document.removeEventListener('mouseup', onDragEnd);
+
+  try {
+    const tagList = document.getElementById('tag-list');
+    const dragItem = dragState.dragItem;
+    const targetId = dragState.targetId;
+
+    // 先清除所有拖拽高亮边框（插入前清除一次）
+    clearDragIndicators();
+
+    // 清除所有内联样式
+    if (dragItem) {
+      dragItem.removeAttribute('style');
+      dragItem.classList.remove('dragging');
+    }
+
+    // 根据 targetId 将元素插入到正确位置
+    if (tagList && dragItem && targetId) {
+      if (targetId === 'end') {
+        tagList.appendChild(dragItem);
+      } else {
+        const targetEl = tagList.querySelector('[data-tag-id="' + targetId + '"]');
+        if (targetEl) {
+          tagList.insertBefore(dragItem, targetEl);
+        }
+      }
+    }
+
+    // 插入完成后再清除一次，确保没有遗漏
+    clearDragIndicators();
+
+    // 恢复选中标签的高亮样式
+    highlightSelectedTags();
+
+    // 获取新的 DOM 顺序，更新 state.tags
+    if (tagList) {
+      var newOrder = Array.from(tagList.querySelectorAll('.tag-nav-item')).map(function(item) {
+        return parseInt(item.dataset.tagId);
+      });
+      state.tags.sort(function(a, b) { return newOrder.indexOf(a.id) - newOrder.indexOf(b.id); });
+    }
+
+    // 保存新顺序到后端
+    await saveTagOrder();
+  } catch (err) {
+    console.error('拖拽结束处理出错:', err);
+  } finally {
+    // 清理状态
+    dragState.dragging = false;
+    dragState.dragItem = null;
+    dragState.targetId = null;
+  }
+}
+
+function clearDragIndicators() {
+  var tagList = document.getElementById('tag-list');
+  if (!tagList) return;
+  tagList.querySelectorAll('.drag-before').forEach(function(el) { el.classList.remove('drag-before'); });
+  tagList.querySelectorAll('.drag-after').forEach(function(el) { el.classList.remove('drag-after'); });
 }
 
 async function saveTagOrder() {
