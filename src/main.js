@@ -978,7 +978,10 @@ function renderTagManageList() {
         try {
           await invoke('delete_tag', { tagId });
           showToast('标签已删除');
+          // 从已选标签中移除被删除的标签
+          state.selectedTagIds = state.selectedTagIds.filter(id => id !== tagId);
           fetchTags();
+          fetchVideos();
           renderTagManageList();
         } catch (e) {
           showToast('删除标签失败: ' + e, 'error');
@@ -1520,7 +1523,10 @@ function initContextMenu() {
               try {
                 await invoke('delete_tag', { tagId: tagContextTarget });
                 showToast('已删除');
+                // 从已选标签中移除被删除的标签
+                state.selectedTagIds = state.selectedTagIds.filter(id => id !== tagContextTarget);
                 fetchTags();
+                fetchVideos();
               } catch (e) { showToast('失败: ' + e, 'error'); }
             }
             break;
