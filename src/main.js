@@ -1194,6 +1194,7 @@ function bindEvents() {
         showToast('已删除记录');
         document.getElementById('video-modal').classList.add('hidden');
         fetchVideos();
+        fetchTags();
         fetchStats();
       } catch (e) {
         showToast('删除失败: ' + e, 'error');
@@ -1211,6 +1212,7 @@ function bindEvents() {
         showToast(msg);
         document.getElementById('video-modal').classList.add('hidden');
         fetchVideos();
+        fetchTags();
         fetchStats();
       } catch (e) {
         showToast('删除失败: ' + e, 'error');
@@ -1258,6 +1260,7 @@ function bindEvents() {
         var count = await invoke('mark_series_watched', { series: state.currentSeries, watched: true });
         showToast('已标记 ' + count + ' 集为已看过');
         fetchVideos();
+        fetchTags();
         document.getElementById('video-modal').classList.add('hidden');
       } catch (e) {
         showToast('操作失败: ' + e, 'error');
@@ -1417,6 +1420,7 @@ function initContextMenu() {
               await invoke('delete_series', { seriesName: contextMenuSeriesName });
               showToast('剧集已删除');
               fetchVideos();
+              fetchTags();
               fetchStats();
             } catch (e) {
               showToast('删除失败: ' + e, 'error');
@@ -1471,6 +1475,7 @@ function initContextMenu() {
             await invoke('delete_video', { videoId: contextMenuTarget });
             showToast('已删除');
             fetchVideos();
+            fetchTags();
             fetchStats();
           }
           break;

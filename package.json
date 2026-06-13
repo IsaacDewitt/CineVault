@@ -1,6 +1,6 @@
 {
   "name": "movie-ui",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "本地视频管理器",
   "type": "module",
   "scripts": {
