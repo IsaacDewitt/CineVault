@@ -528,7 +528,7 @@ pub fn delete_video(conn: &Connection, video_id: i64) -> Result<(), AppError> {
 pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT
-            v.series_name,
+            COALESCE(v.series_name, '') as series_name,
             COUNT(*) as total,
             SUM(CASE WHEN EXISTS (
                 SELECT 1 FROM video_tags vt
@@ -538,9 +538,9 @@ pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, App
             COALESCE(SUM(v.file_size), 0),
             COALESCE(AVG(CASE WHEN v.rating > 0 THEN v.rating END), 0)
          FROM videos v
-         WHERE v.video_type = 'episode' AND v.series_name IS NOT NULL
-         GROUP BY v.series_name
-         ORDER BY v.series_name"
+         WHERE v.video_type = 'episode'
+         GROUP BY COALESCE(v.series_name, '')
+         ORDER BY COALESCE(v.series_name, '')"
     )?;
 
     let series = stmt.query_map([], |row| {
@@ -558,27 +558,53 @@ pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, App
 
 /// 获取某个剧集的所有剧集（按 SxxExx 或集数排序）
 pub fn get_series_episodes(conn: &Connection, series_name: &str) -> Result<Vec<VideoWithTags>, AppError> {
-    let sql = format!(
-        "SELECT
-            v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating,
-            v.is_favorite, v.video_type, v.series_name, v.season, v.episode, v.thumbnail_path,
-            v.last_watched_at, v.watch_progress, v.created_at, v.updated_at,
-            GROUP_CONCAT(t.id || '\x1F' || t.name || '\x1F' || t.color, '\x1E')
-         FROM videos v
-         LEFT JOIN video_tags vt ON v.id = vt.video_id
-         LEFT JOIN tags t ON vt.tag_id = t.id
-         WHERE v.series_name = ?1
-         GROUP BY v.id
-         ORDER BY COALESCE(v.season, 1), COALESCE(v.episode, 999999)"
-    );
+    let sql = if series_name.is_empty() {
+        // 空字符串剧集：匹配空字符串或 NULL
+        format!(
+            "SELECT
+                v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating,
+                v.is_favorite, v.video_type, v.series_name, v.season, v.episode, v.thumbnail_path,
+                v.last_watched_at, v.watch_progress, v.created_at, v.updated_at,
+                GROUP_CONCAT(t.id || '\x1F' || t.name || '\x1F' || t.color, '\x1E')
+             FROM videos v
+             LEFT JOIN video_tags vt ON v.id = vt.video_id
+             LEFT JOIN tags t ON vt.tag_id = t.id
+             WHERE (v.series_name = '' OR v.series_name IS NULL) AND v.video_type = 'episode'
+             GROUP BY v.id
+             ORDER BY COALESCE(v.season, 1), COALESCE(v.episode, 999999)"
+        )
+    } else {
+        format!(
+            "SELECT
+                v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating,
+                v.is_favorite, v.video_type, v.series_name, v.season, v.episode, v.thumbnail_path,
+                v.last_watched_at, v.watch_progress, v.created_at, v.updated_at,
+                GROUP_CONCAT(t.id || '\x1F' || t.name || '\x1F' || t.color, '\x1E')
+             FROM videos v
+             LEFT JOIN video_tags vt ON v.id = vt.video_id
+             LEFT JOIN tags t ON vt.tag_id = t.id
+             WHERE v.series_name = ?1
+             GROUP BY v.id
+             ORDER BY COALESCE(v.season, 1), COALESCE(v.episode, 999999)"
+        )
+    };
 
     let mut stmt = conn.prepare(&sql)?;
-    let videos = stmt.query_map(params![series_name], |row| {
-        let video = row_to_video(row)?;
-        let tags_str: Option<String> = row.get(17)?;
-        let tags = parse_tags_string(tags_str);
-        Ok(VideoWithTags { video, tags })
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let videos = if series_name.is_empty() {
+        stmt.query_map([], |row| {
+            let video = row_to_video(row)?;
+            let tags_str: Option<String> = row.get(17)?;
+            let tags = parse_tags_string(tags_str);
+            Ok(VideoWithTags { video, tags })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map(params![series_name], |row| {
+            let video = row_to_video(row)?;
+            let tags_str: Option<String> = row.get(17)?;
+            let tags = parse_tags_string(tags_str);
+            Ok(VideoWithTags { video, tags })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
     Ok(videos)
 }
