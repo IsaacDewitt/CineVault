@@ -108,6 +108,13 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_videos_favorite ON videos(is_favorite);
         CREATE INDEX IF NOT EXISTS idx_watch_history_video ON watch_history(video_id);
 
+        CREATE TABLE IF NOT EXISTS scan_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_path TEXT NOT NULL UNIQUE,
+            video_count INTEGER NOT NULL DEFAULT 0,
+            last_scanned_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+
         -- 默认标签
         INSERT OR IGNORE INTO tags (name, color) VALUES ('已看过', '#10b981');
         INSERT OR IGNORE INTO tags (name, color) VALUES ('未看过', '#6b6b80');
@@ -613,4 +620,49 @@ pub fn mark_series_watched(conn: &Connection, series_name: &str, watched: bool) 
     }
 
     Ok(count)
+}
+
+// ============================================
+// 已扫描文件夹管理
+// ============================================
+
+/// 获取所有已扫描文件夹
+pub fn get_scan_folders(conn: &Connection) -> Result<Vec<crate::models::ScanFolder>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, folder_path, video_count, last_scanned_at FROM scan_folders ORDER BY last_scanned_at DESC"
+    )?;
+    let folders = stmt.query_map([], |row| {
+        Ok(crate::models::ScanFolder {
+            id: row.get(0)?,
+            folder_path: row.get(1)?,
+            video_count: row.get(2)?,
+            last_scanned_at: row.get(3)?,
+        })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(folders)
+}
+
+/// 添加或更新已扫描文件夹记录
+pub fn upsert_scan_folder(conn: &Connection, folder_path: &str) -> Result<(), AppError> {
+    // 统计该文件夹下的视频数量
+    let pattern = format!("{}%", folder_path.replace('\\', "/").trim_end_matches('/'));
+    let video_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM videos WHERE REPLACE(file_path, '\\', '/') LIKE ?1",
+        params![pattern],
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    conn.execute(
+        "INSERT INTO scan_folders (folder_path, video_count, last_scanned_at)
+         VALUES (?1, ?2, datetime('now','localtime'))
+         ON CONFLICT(folder_path) DO UPDATE SET video_count = ?2, last_scanned_at = datetime('now','localtime')",
+        params![folder_path, video_count],
+    )?;
+    Ok(())
+}
+
+/// 删除已扫描文件夹记录
+pub fn delete_scan_folder(conn: &Connection, folder_id: i64) -> Result<(), AppError> {
+    conn.execute("DELETE FROM scan_folders WHERE id = ?1", params![folder_id])?;
+    Ok(())
 }

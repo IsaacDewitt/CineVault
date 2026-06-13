@@ -79,6 +79,8 @@ fn main() {
             commands::delete_videos_by_folder,
             commands::clean_non_videos,
             commands::get_drives,
+            commands::get_scan_folders,
+            commands::delete_scan_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

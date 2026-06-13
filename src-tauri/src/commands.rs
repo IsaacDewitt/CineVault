@@ -104,6 +104,9 @@ pub fn scan_videos(
 
     conn.execute_batch("COMMIT").map_err(|e| AppError::db(e.to_string()))?;
 
+    // 记录已扫描文件夹
+    let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
+
     let series_detected: Vec<SeriesInfo> = series_map
         .into_iter()
         .map(|(name, (folder, count))| SeriesInfo {
@@ -145,10 +148,11 @@ pub fn get_videos_by_tag(db: State<'_, DbConn>, tag_id: i64, page: Option<i64>, 
 
 /// 多标签筛选（AND 逻辑：视频必须同时拥有所有指定标签）
 /// video_type: 可选，限定视频类型（"movie" / "episode"）
+/// favorites_only: 可选，是否只显示收藏视频
 #[tauri::command]
-pub fn get_videos_by_tags(db: State<'_, DbConn>, tag_ids: Vec<i64>, video_type: Option<String>, page: Option<i64>, page_size: Option<i64>) -> Result<PaginatedVideos, String> {
+pub fn get_videos_by_tags(db: State<'_, DbConn>, tag_ids: Vec<i64>, video_type: Option<String>, favorites_only: Option<bool>, page: Option<i64>, page_size: Option<i64>) -> Result<PaginatedVideos, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    if tag_ids.is_empty() && video_type.is_none() {
+    if tag_ids.is_empty() && video_type.is_none() && favorites_only != Some(true) {
         return crate::db::get_all_videos(&conn, page.unwrap_or(0), page_size.unwrap_or(50)).map_err(|e| e.to_string());
     }
     // 构建 WHERE EXISTS 子查询：视频必须拥有所有指定标签
@@ -159,6 +163,10 @@ pub fn get_videos_by_tags(db: State<'_, DbConn>, tag_ids: Vec<i64>, video_type: 
     // 可选：限定视频类型
     if let Some(ref vtype) = video_type {
         conditions.push(format!("v.video_type = '{}'", vtype));
+    }
+    // 可选：只显示收藏视频
+    if favorites_only == Some(true) {
+        conditions.push("v.is_favorite = 1".to_string());
     }
     let where_clause = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
     let params: Vec<Box<dyn rusqlite::types::ToSql>> = tag_ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
@@ -487,6 +495,9 @@ pub fn scan_series(
 
     conn.execute_batch("COMMIT").map_err(|e| AppError::db(e.to_string()))?;
 
+    // 记录已扫描文件夹
+    let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
+
     let mut series_detected = Vec::new();
     series_detected.push(SeriesInfo { name: series_name, episode_count: new_added + updated, folder_path: dir_path });
 
@@ -668,4 +679,18 @@ pub struct DriveInfo {
     pub letter: String,
     pub path: String,
     pub label: String,
+}
+
+/// 获取已扫描文件夹列表
+#[tauri::command]
+pub fn get_scan_folders(db: State<'_, DbConn>) -> Result<Vec<ScanFolder>, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::get_scan_folders(&conn).map_err(|e| e.to_string())
+}
+
+/// 删除已扫描文件夹记录
+#[tauri::command]
+pub fn delete_scan_folder(db: State<'_, DbConn>, folder_id: i64) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::delete_scan_folder(&conn, folder_id).map_err(|e| e.to_string())
 }

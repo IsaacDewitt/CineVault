@@ -792,6 +792,71 @@ body {
 }
 
 /* ============================================
+   Scanned Folders List
+   ============================================ */
+.scan-folder-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border-radius: var(--radius-xs);
+  margin-bottom: 6px;
+  font-size: 13px;
+  transition: background 0.15s;
+}
+
+.scan-folder-item:hover {
+  background: var(--bg-card-hover);
+}
+
+.scan-folder-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.scan-folder-path:hover {
+  color: var(--accent);
+}
+
+.scan-folder-count {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.scan-folder-delete {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.scan-folder-item:hover .scan-folder-delete {
+  opacity: 1;
+}
+
+.scan-folder-delete:hover {
+  color: var(--danger);
+}
+
+.scan-folders-empty {
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+  padding: 12px 0;
+}
+
+/* ============================================
    Tag Management
    ============================================ */
 .tag-create {

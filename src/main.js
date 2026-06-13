@@ -37,6 +37,12 @@ const dragState = {
 // ============================================
 // 工具函数
 // ============================================
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
 function formatSize(bytes) {
   if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -118,31 +124,29 @@ async function fetchVideos(append = false) {
 
     switch (state.currentView) {
       case 'favorites':
-        result = await invoke('get_favorites', { page, pageSize: PAGE_SIZE });
+        // 收藏夹 + 标签组合筛选
+        if (state.selectedTagIds.length > 0) {
+          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, videoType: null, favoritesOnly: true, page, pageSize: PAGE_SIZE });
+        } else {
+          result = await invoke('get_favorites', { page, pageSize: PAGE_SIZE });
+        }
         break;
       case 'series':
-        // 剧集视图：显示剧集概览，不是单个视频
-        var seriesList = await invoke('get_series_overview');
-        state.videos = [];
-        state.seriesList = seriesList || [];
-        state.totalCount = state.seriesList.length;
-        state.hasMore = false;
-        applyFilters();
-        renderSeriesOverview();
-        updateStats();
-        state.loading = false;
-        return;
-      case 'tag':
-        // 根据之前的视图限定视频类型
-        var vtype = null;
-        if (state.previousView === 'all') vtype = 'movie';
-        else if (state.previousView === 'series') vtype = 'episode';
+        // 剧集 + 标签组合筛选
         if (state.selectedTagIds.length > 0) {
-          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, videoType: vtype, page, pageSize: PAGE_SIZE });
-        } else if (vtype) {
-          result = await invoke('get_videos_by_tags', { tagIds: [], videoType: vtype, page, pageSize: PAGE_SIZE });
+          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, videoType: 'episode', page, pageSize: PAGE_SIZE });
         } else {
-          result = await invoke('get_movies', { page, pageSize: PAGE_SIZE });
+          // 剧集视图：显示剧集概览，不是单个视频
+          var seriesList = await invoke('get_series_overview');
+          state.videos = [];
+          state.seriesList = seriesList || [];
+          state.totalCount = state.seriesList.length;
+          state.hasMore = false;
+          applyFilters();
+          renderSeriesOverview();
+          updateStats();
+          state.loading = false;
+          return;
         }
         break;
       case 'series-episodes':
@@ -157,7 +161,10 @@ async function fetchVideos(append = false) {
         state.loading = false;
         return;
       default:
-        if (state.searchQuery) {
+        // 电影（默认）+ 标签组合筛选
+        if (state.selectedTagIds.length > 0) {
+          result = await invoke('get_videos_by_tags', { tagIds: state.selectedTagIds, videoType: 'movie', page, pageSize: PAGE_SIZE });
+        } else if (state.searchQuery) {
           result = await invoke('search_videos', { query: state.searchQuery, page, pageSize: PAGE_SIZE });
         } else {
           result = await invoke('get_movies', { page, pageSize: PAGE_SIZE });
@@ -419,12 +426,7 @@ function renderTags() {
       const tagId = parseInt(item.dataset.tagId);
       const tagName = item.querySelector('span:nth-child(3)').textContent.trim();
 
-      // 首次切到标签视图时，记住之前的视图（用于限定视频类型）
-      if (state.currentView !== 'tag') {
-        state.previousView = state.currentView;
-      }
-      state.currentView = 'tag';
-
+      // 不改变 currentView，标签作为次筛选器与主导航组合使用
       var idx = state.selectedTagIds.indexOf(tagId);
       if (idx >= 0) {
         // 已选中 → 取消选中
@@ -446,11 +448,6 @@ function renderTags() {
           }
         }
         state.selectedTagIds.push(tagId);
-      }
-
-      // 如果全部取消选中，回到之前的视图
-      if (state.selectedTagIds.length === 0) {
-        state.currentView = state.previousView;
       }
 
       updateNavActive();
@@ -854,6 +851,50 @@ function openScanDialog() {
   document.getElementById('scan-result').classList.add('hidden');
   document.getElementById('scan-progress').classList.add('hidden');
   document.getElementById('scan-path').value = '';
+  loadScanFolders();
+}
+
+async function loadScanFolders() {
+  const list = document.getElementById('scan-folders-list');
+  const section = document.getElementById('scan-folders-section');
+  try {
+    const folders = await invoke('get_scan_folders');
+    if (!folders || folders.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+    list.innerHTML = folders.map(f => `
+      <div class="scan-folder-item" data-path="${escapeHtml(f.folder_path)}">
+        <span class="scan-folder-path" title="${escapeHtml(f.folder_path)}">${escapeHtml(f.folder_path)}</span>
+        <span class="scan-folder-count">${f.video_count} 个视频</span>
+        <button class="scan-folder-delete" data-id="${f.id}" title="移除记录">✕</button>
+      </div>
+    `).join('');
+
+    // 点击路径：填入扫描输入框
+    list.querySelectorAll('.scan-folder-path').forEach(el => {
+      el.addEventListener('click', () => {
+        document.getElementById('scan-path').value = el.closest('.scan-folder-item').dataset.path;
+      });
+    });
+
+    // 删除记录
+    list.querySelectorAll('.scan-folder-delete').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = parseInt(btn.dataset.id);
+        try {
+          await invoke('delete_scan_folder', { folderId: id });
+          loadScanFolders();
+        } catch (e) {
+          showToast('删除失败: ' + e, 'error');
+        }
+      });
+    });
+  } catch (e) {
+    section.style.display = 'none';
+  }
 }
 
 async function startScan() {
@@ -900,6 +941,7 @@ async function startScan() {
     fetchVideos();
     fetchTags();
     fetchStats();
+    loadScanFolders();
     showToast(`扫描完成，新增 ${result.new_added} 个视频`);
   } catch (e) {
     document.getElementById('scan-status').textContent = '扫描失败';
@@ -1403,9 +1445,15 @@ function initContextMenu() {
             }
             break;
           case 'filter':
-            state.currentView = 'tag';
-            state.currentTagId = tagContextTarget;
+            // 添加标签到选中列表（作为次筛选器）
+            if (tagContextTarget) {
+              var idx = state.selectedTagIds.indexOf(tagContextTarget);
+              if (idx < 0) {
+                state.selectedTagIds.push(tagContextTarget);
+              }
+            }
             updateNavActive();
+            highlightSelectedTags();
             fetchVideos();
             break;
           case 'rename-tag':

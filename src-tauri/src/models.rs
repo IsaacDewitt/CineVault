@@ -159,6 +159,15 @@ pub struct PaginatedVideos {
     pub has_more: bool,
 }
 
+/// 已扫描文件夹记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanFolder {
+    pub id: i64,
+    pub folder_path: String,
+    pub video_count: i64,
+    pub last_scanned_at: String,
+}
+
 /// #1/#7: upsert_video 返回值，区分插入和更新
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpsertResult {
