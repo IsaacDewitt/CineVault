@@ -121,6 +121,7 @@ pub struct VideoStats {
     pub favorites_count: i64,
     pub watched_count: i64,
     pub average_rating: f64,
+    pub movie_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

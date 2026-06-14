@@ -488,7 +488,8 @@ pub fn get_stats(conn: &Connection) -> Result<VideoStats, AppError> {
             COALESCE(SUM(file_size), 0),
             SUM(CASE WHEN is_favorite = 1 THEN 1 ELSE 0 END),
             SUM(CASE WHEN last_watched_at IS NOT NULL THEN 1 ELSE 0 END),
-            COALESCE(AVG(CASE WHEN rating > 0 THEN rating END), 0)
+            COALESCE(AVG(CASE WHEN rating > 0 THEN rating END), 0),
+            SUM(CASE WHEN video_type = 'movie' THEN 1 ELSE 0 END)
          FROM videos",
         [],
         |row| {
@@ -499,6 +500,7 @@ pub fn get_stats(conn: &Connection) -> Result<VideoStats, AppError> {
                 favorites_count: row.get(3)?,
                 watched_count: row.get(4)?,
                 average_rating: row.get(5)?,
+                movie_count: row.get(6)?,
             })
         },
     )?;

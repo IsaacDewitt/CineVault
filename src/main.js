@@ -685,7 +685,7 @@ function updateStats() {
 }
 
 function updateStatsDisplay(stats) {
-  document.getElementById('count-all').textContent = stats.total_videos;
+  document.getElementById('count-all').textContent = stats.movie_count;
   document.getElementById('count-fav').textContent = stats.favorites_count;
   document.getElementById('count-series').textContent = stats.total_series;
   document.getElementById('stat-series').textContent = `${stats.total_series} 个剧集`;
