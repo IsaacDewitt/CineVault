@@ -148,7 +148,30 @@ async function fetchVideos(append = false) {
             });
           }
           state.videos = [];
-          state.seriesList = seriesList || [];
+          var filtered = seriesList || [];
+
+          // 评分过滤
+          if (state.ratingFilter > 0) {
+            filtered = filtered.filter(function(s) { return (s.rating || 0) >= state.ratingFilter; });
+          }
+
+          // 排序
+          switch (state.sortBy) {
+            case 'name':
+              filtered.sort(function(a, b) { return (a.name || '').localeCompare(b.name || ''); });
+              break;
+            case 'size':
+              filtered.sort(function(a, b) { return (b.total_size || 0) - (a.total_size || 0); });
+              break;
+            case 'rating':
+              filtered.sort(function(a, b) { return (b.rating || 0) - (a.rating || 0); });
+              break;
+            case 'updated':
+            default:
+              filtered.sort(function(a, b) { return new Date(b.updated_at || 0) - new Date(a.updated_at || 0); });
+          }
+
+          state.seriesList = filtered;
           state.totalCount = state.seriesList.length;
           state.hasMore = false;
           applyFilters();
