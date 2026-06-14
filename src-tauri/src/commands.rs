@@ -536,6 +536,20 @@ pub fn mark_series_watched(db: State<'_, DbConn>, series: String, watched: bool)
     crate::db::mark_series_watched(&conn, &series, watched).map_err(|e| e.to_string())
 }
 
+/// 批量设置剧集评分
+#[tauri::command]
+pub fn set_series_rating(db: State<'_, DbConn>, series_name: String, rating: f64) -> Result<i64, String> {
+    if !rating.is_finite() || rating < 0.0 || rating > 10.0 {
+        return Err("评分必须在 0-10 之间".to_string());
+    }
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    let count = conn.execute(
+        "UPDATE videos SET rating = ?1, updated_at = datetime('now','localtime') WHERE series_name = ?2",
+        rusqlite::params![rating, series_name],
+    ).map_err(|e| AppError::db(e.to_string()))?;
+    Ok(count as i64)
+}
+
 /// 修改视频标题
 #[tauri::command]
 pub fn rename_video(db: State<'_, DbConn>, video_id: i64, new_title: String) -> Result<(), String> {
@@ -582,6 +596,70 @@ pub fn delete_series(db: State<'_, DbConn>, series_name: String) -> Result<(), S
         rusqlite::params![series_name],
     ).map_err(|e| AppError::db(e.to_string()))?;
     Ok(())
+}
+
+/// 给剧集下所有视频批量添加标签
+#[tauri::command]
+pub fn add_series_tag(db: State<'_, DbConn>, series_name: String, tag_id: i64) -> Result<i64, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    // 查询该剧集下的所有视频 ID
+    let mut stmt = conn.prepare(
+        "SELECT id FROM videos WHERE series_name = ?1"
+    ).map_err(|e| AppError::db(e.to_string()))?;
+    let video_ids: Vec<i64> = stmt.query_map(rusqlite::params![series_name], |row| row.get(0))
+        .map_err(|e| AppError::db(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+    // 为每个视频添加标签（忽略已存在的）
+    let mut count = 0;
+    for vid in &video_ids {
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO video_tags (video_id, tag_id) VALUES (?1, ?2)",
+            rusqlite::params![vid, tag_id],
+        );
+        if result.is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// 删除剧集记录 + 所有文件
+#[tauri::command]
+pub fn delete_series_with_files(db: State<'_, DbConn>, series_name: String) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    // 查询该剧集下的所有文件路径
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM videos WHERE series_name = ?1"
+    ).map_err(|e| AppError::db(e.to_string()))?;
+    let file_paths: Vec<String> = stmt.query_map(rusqlite::params![series_name], |row| row.get(0))
+        .map_err(|e| AppError::db(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let total_count = file_paths.len();
+    // 删除数据库记录
+    conn.execute(
+        "DELETE FROM videos WHERE series_name = ?1",
+        rusqlite::params![series_name],
+    ).map_err(|e| AppError::db(e.to_string()))?;
+    // 删除所有文件
+    let mut deleted = 0;
+    let mut errors = Vec::new();
+    for path in &file_paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    errors.push(format!("{}: {}", path, e));
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(format!("已删除 {} 条记录和 {} 个文件", total_count, deleted))
+    } else {
+        Ok(format!("已删除 {} 条记录和 {} 个文件，{} 个文件删除失败", total_count, deleted, errors.len()))
+    }
 }
 
 /// 删除视频文件 + 数据库记录

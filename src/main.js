@@ -918,6 +918,226 @@ function showTagSelector(videoId) {
   }
 }
 
+function showSeriesTagSelector(seriesName) {
+  var displayName = seriesName && seriesName.trim() !== '' ? seriesName : '未命名剧集';
+
+  // 构建选择列表 HTML（剧集模式不需要排除已绑定的标签，因为是批量操作）
+  var listHtml = '';
+  for (var i = 0; i < state.tags.length; i++) {
+    listHtml += '<div class="tag-select-item" data-tag-id="' + state.tags[i].id + '" style="display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;border-radius:6px;transition:background 0.15s;">' +
+      '<span style="width:12px;height:12px;border-radius:50%;background:' + state.tags[i].color + ';flex-shrink:0;"></span>' +
+      '<span style="color:#e8e8e8;font-size:14px;">' + state.tags[i].name + '</span>' +
+    '</div>';
+  }
+  if (state.tags.length === 0) {
+    listHtml = '<div style="color:#6b6b80;font-size:13px;padding:8px;">暂无可用标签，请在下方创建</div>';
+  }
+
+  // 创建内联选择器
+  var existing = document.getElementById('tag-selector-inline');
+  if (existing) existing.remove();
+
+  var selector = document.createElement('div');
+  selector.id = 'tag-selector-inline';
+  selector.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:10000;background:#1a1a2e;border:1px solid #2d2d4a;border-radius:12px;padding:20px;min-width:280px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+  selector.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
+      '<div style="color:#e8e8e8;font-size:15px;font-weight:600;">给「' + displayName + '」打标签</div>' +
+      '<div id="tag-selector-close" style="cursor:pointer;color:#6b6b80;font-size:18px;padding:4px;">✕</div>' +
+    '</div>' +
+    '<div style="color:#a0a0b8;font-size:12px;margin-bottom:8px;">选择标签（将应用到该剧集的所有视频）：</div>' +
+    '<div id="tag-selector-list" style="max-height:250px;overflow-y:auto;margin-bottom:12px;">' + listHtml + '</div>' +
+    '<div style="padding-top:12px;border-top:1px solid #2d2d4a;">' +
+      '<div style="color:#a0a0b8;font-size:12px;margin-bottom:6px;">或创建新标签：</div>' +
+      '<div style="display:flex;gap:6px;">' +
+        '<input type="text" id="tag-selector-new-name" placeholder="标签名" style="flex:1;padding:6px 10px;background:#252540;border:1px solid #2d2d4a;border-radius:6px;color:#e8e8e8;font-size:13px;font-family:var(--font);" />' +
+        '<input type="color" id="tag-selector-new-color" value="#6366f1" style="width:36px;height:32px;border:1px solid #2d2d4a;border-radius:6px;cursor:pointer;background:transparent;padding:2px;" />' +
+        '<button id="tag-selector-create" style="padding:6px 12px;background:#6366f1;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;">创建</button>' +
+      '</div>' +
+    '</div>';
+
+  document.body.appendChild(selector);
+
+  // 添加遮罩层
+  var overlay = document.createElement('div');
+  overlay.id = 'tag-selector-overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;background:rgba(0,0,0,0.5);';
+  document.body.appendChild(overlay);
+
+  // 关闭按钮
+  var closeBtn = document.getElementById('tag-selector-close');
+  if (closeBtn) {
+    closeBtn.onclick = function() {
+      selector.remove();
+      overlay.remove();
+    };
+  }
+  overlay.onclick = function() {
+    selector.remove();
+    overlay.remove();
+  };
+
+  // 绑定已有标签点击
+  selector.querySelectorAll('.tag-select-item').forEach(function(item) {
+    item.onmouseenter = function() { item.style.background = '#252540'; };
+    item.onmouseleave = function() { item.style.background = 'transparent'; };
+    item.onclick = async function() {
+      var tagId = parseInt(item.dataset.tagId);
+      try {
+        var count = await invoke('add_series_tag', { seriesName: seriesName, tagId: tagId });
+        showToast('已为 ' + count + ' 个视频添加标签');
+        selector.remove();
+        overlay.remove();
+        await fetchVideos();
+        await fetchTags();
+      } catch (e) {
+        showToast('添加失败: ' + e, 'error');
+      }
+    };
+  });
+
+  // 绑定创建新标签
+  var createBtn = document.getElementById('tag-selector-create');
+  if (createBtn) {
+    createBtn.onclick = async function() {
+      var nameInput = document.getElementById('tag-selector-new-name');
+      var colorInput = document.getElementById('tag-selector-new-color');
+      var name = nameInput.value.trim();
+      if (!name) { showToast('请输入标签名', 'error'); return; }
+      try {
+        var newTag = await invoke('create_tag', { name: name, color: colorInput.value });
+        var count = await invoke('add_series_tag', { seriesName: seriesName, tagId: newTag.id });
+        showToast('已创建标签并为 ' + count + ' 个视频添加');
+        selector.remove();
+        overlay.remove();
+        await fetchVideos();
+        await fetchTags();
+      } catch (e) {
+        showToast('创建失败: ' + e, 'error');
+      }
+    };
+  }
+}
+
+function showSeriesRatingSelector(seriesName) {
+  var displayName = seriesName && seriesName.trim() !== '' ? seriesName : '未命名剧集';
+
+  // 查找该剧集当前的评分（从剧集概览中获取）
+  var currentRating = 0;
+  var seriesData = state.seriesList && state.seriesList.find(function(s) { return s.name === seriesName; });
+  if (seriesData) {
+    currentRating = seriesData.rating || 0;
+  }
+
+  // 创建评分选择器
+  var existing = document.getElementById('rating-selector-inline');
+  if (existing) existing.remove();
+
+  var selector = document.createElement('div');
+  selector.id = 'rating-selector-inline';
+  selector.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:10000;background:#1a1a2e;border:1px solid #2d2d4a;border-radius:12px;padding:20px;min-width:300px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+
+  var starsHtml = '<div style="display:flex;gap:4px;margin:12px 0;">';
+  for (var i = 1; i <= 10; i++) {
+    var activeClass = i <= currentRating ? 'background:#fbbf24;' : 'background:#252540;';
+    starsHtml += '<button class="series-rating-star" data-rating="' + i + '" style="width:28px;height:28px;border:1px solid #2d2d4a;border-radius:4px;cursor:pointer;font-size:16px;color:' + (i <= currentRating ? '#fbbf24' : '#6b6b80') + ';' + activeClass + '">' + (i <= currentRating ? '★' : '☆') + '</button>';
+  }
+  starsHtml += '</div>';
+
+  selector.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
+      '<div style="color:#e8e8e8;font-size:15px;font-weight:600;">给「' + displayName + '」评分</div>' +
+      '<div id="rating-selector-close" style="cursor:pointer;color:#6b6b80;font-size:18px;padding:4px;">✕</div>' +
+    '</div>' +
+    '<div style="color:#a0a0b8;font-size:12px;margin-bottom:4px;">评分将应用到该剧集的所有视频（1-10 分）</div>' +
+    starsHtml +
+    '<div style="color:#a0a0b8;font-size:13px;text-align:center;">当前评分：<span id="rating-display" style="color:#fbbf24;font-weight:600;">' + (currentRating > 0 ? currentRating + ' 分' : '未评分') + '</span></div>' +
+    '<div style="margin-top:12px;text-align:center;">' +
+      '<button id="rating-selector-clear" style="padding:6px 12px;background:#252540;color:#a0a0b8;border:1px solid #2d2d4a;border-radius:6px;cursor:pointer;font-size:13px;margin-right:8px;">清除评分</button>' +
+      '<button id="rating-selector-confirm" style="padding:6px 16px;background:#6366f1;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;">确定</button>' +
+    '</div>';
+
+  document.body.appendChild(selector);
+
+  // 添加遮罩层
+  var overlay = document.createElement('div');
+  overlay.id = 'rating-selector-overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;background:rgba(0,0,0,0.5);';
+  document.body.appendChild(overlay);
+
+  var selectedRating = currentRating;
+
+  // 关闭按钮
+  var closeBtn = document.getElementById('rating-selector-close');
+  if (closeBtn) {
+    closeBtn.onclick = function() {
+      selector.remove();
+      overlay.remove();
+    };
+  }
+  overlay.onclick = function() {
+    selector.remove();
+    overlay.remove();
+  };
+
+  // 星星点击
+  selector.querySelectorAll('.series-rating-star').forEach(function(btn) {
+    btn.onclick = function() {
+      selectedRating = parseInt(btn.dataset.rating);
+      // 更新显示
+      selector.querySelectorAll('.series-rating-star').forEach(function(b) {
+        var r = parseInt(b.dataset.rating);
+        if (r <= selectedRating) {
+          b.style.background = '#fbbf24';
+          b.style.color = '#fbbf24';
+          b.textContent = '★';
+        } else {
+          b.style.background = '#252540';
+          b.style.color = '#6b6b80';
+          b.textContent = '☆';
+        }
+      });
+      document.getElementById('rating-display').textContent = selectedRating + ' 分';
+    };
+  });
+
+  // 清除评分
+  var clearBtn = document.getElementById('rating-selector-clear');
+  if (clearBtn) {
+    clearBtn.onclick = async function() {
+      try {
+        await invoke('set_series_rating', { seriesName: seriesName, rating: 0 });
+        showToast('已清除「' + displayName + '」的评分');
+        selector.remove();
+        overlay.remove();
+        fetchVideos();
+      } catch (e) {
+        showToast('操作失败: ' + e, 'error');
+      }
+    };
+  }
+
+  // 确定按钮
+  var confirmBtn = document.getElementById('rating-selector-confirm');
+  if (confirmBtn) {
+    confirmBtn.onclick = async function() {
+      if (selectedRating <= 0) {
+        showToast('请选择评分', 'error');
+        return;
+      }
+      try {
+        var count = await invoke('set_series_rating', { seriesName: seriesName, rating: selectedRating });
+        showToast('已为「' + displayName + '」的 ' + count + ' 个视频评 ' + selectedRating + ' 分');
+        selector.remove();
+        overlay.remove();
+        fetchVideos();
+      } catch (e) {
+        showToast('评分失败: ' + e, 'error');
+      }
+    };
+  }
+}
+
 // ============================================
 // 扫描对话框
 // ============================================
@@ -1460,8 +1680,8 @@ function initContextMenu() {
       menu.querySelectorAll('.ctx-item').forEach(function(item) {
         var action = item.dataset.action;
         if (contextMenuIsSeries) {
-          // 剧集卡片只显示：改名、删除
-          if (action === 'rename' || action === 'delete') {
+          // 剧集卡片显示：改名、添加标签、已看过、评分、删除记录、删除文件
+          if (action === 'rename' || action === 'tag' || action === 'watched' || action === 'rating' || action === 'delete' || action === 'delete-file') {
             item.style.display = '';
           } else {
             item.style.display = 'none';
@@ -1518,13 +1738,17 @@ function initContextMenu() {
               showToast('改名失败: ' + e, 'error');
             }
           }
+        } else if (action === 'tag') {
+          // 给剧集打标签
+          showSeriesTagSelector(contextMenuSeriesName);
+          return;
         } else if (action === 'delete') {
           var displayName2 = contextMenuSeriesName && contextMenuSeriesName.trim() !== '' ? contextMenuSeriesName : '未命名剧集';
-          var delOk = await showConfirm('删除剧集', '确定删除「' + displayName2 + '」的所有记录？\n\n不会删除本地文件。');
+          var delOk = await showConfirm('删除剧集记录', '确定删除「' + displayName2 + '」的所有记录？\n\n不会删除本地文件。');
           if (delOk) {
             try {
               await invoke('delete_series', { seriesName: contextMenuSeriesName });
-              showToast('剧集已删除');
+              showToast('剧集记录已删除');
               fetchVideos();
               fetchTags();
               fetchStats();
@@ -1532,6 +1756,36 @@ function initContextMenu() {
               showToast('删除失败: ' + e, 'error');
             }
           }
+        } else if (action === 'delete-file') {
+          // 删除剧集记录和文件
+          var displayName3 = contextMenuSeriesName && contextMenuSeriesName.trim() !== '' ? contextMenuSeriesName : '未命名剧集';
+          var delFileOk = await showConfirm('删除剧集文件', '确定删除「' + displayName3 + '」的所有记录和本地文件？\n\n⚠️ 此操作不可恢复！');
+          if (delFileOk) {
+            try {
+              var result = await invoke('delete_series_with_files', { seriesName: contextMenuSeriesName });
+              showToast(result);
+              fetchVideos();
+              fetchTags();
+              fetchStats();
+            } catch (e) {
+              showToast('删除失败: ' + e, 'error');
+            }
+          }
+        } else if (action === 'watched') {
+          // 切换剧集已看过状态
+          try {
+            var displayName4 = contextMenuSeriesName && contextMenuSeriesName.trim() !== '' ? contextMenuSeriesName : '未命名剧集';
+            var count = await invoke('mark_series_watched', { series: contextMenuSeriesName, watched: true });
+            showToast('已标记「' + displayName4 + '」为已看过 (' + count + ' 集)');
+            fetchVideos();
+            fetchTags();
+            fetchStats();
+          } catch (e) {
+            showToast('操作失败: ' + e, 'error');
+          }
+        } else if (action === 'rating') {
+          // 给剧集评分
+          showSeriesRatingSelector(contextMenuSeriesName);
         }
         return;
       }
