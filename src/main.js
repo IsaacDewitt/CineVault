@@ -118,6 +118,9 @@ async function fetchVideos(append = false) {
   if (state.loading) return;
   state.loading = true;
 
+  // 默认隐藏面包屑导航
+  document.getElementById('series-breadcrumb').classList.add('hidden');
+
   try {
     const page = append ? state.currentPage : 0;
     let result;
@@ -174,6 +177,14 @@ async function fetchVideos(append = false) {
         applyFilters();
         renderVideos();
         updateStats();
+
+        // 显示面包屑导航
+        var breadcrumb = document.getElementById('series-breadcrumb');
+        var seriesDisplayName = state.currentSeries && state.currentSeries.trim() !== '' ? state.currentSeries : '未命名剧集';
+        document.getElementById('breadcrumb-series-name').textContent = seriesDisplayName;
+        document.getElementById('breadcrumb-episode-count').textContent = state.videos.length + ' 集';
+        breadcrumb.classList.remove('hidden');
+
         state.loading = false;
         return;
       default:
@@ -681,15 +692,62 @@ function updateNavActive() {
 // ============================================
 function updateStats() {
   const getVideo = (item) => item.video || item;
-  document.getElementById('stat-total').textContent = `${state.totalCount} 个视频`;
+  const statTotal = document.getElementById('stat-total');
+  const statSeries = document.getElementById('stat-series');
+  const statSize = document.getElementById('stat-size');
+
+  if (state.currentView === 'series-episodes') {
+    // 剧集详情页：显示集数
+    statTotal.textContent = `${state.totalCount} 集`;
+    statSeries.classList.add('hidden');
+    // 计算当前剧集的总大小
+    let totalSize = 0;
+    state.videos.forEach(v => {
+      const video = v.video || v;
+      totalSize += video.file_size || 0;
+    });
+    statSize.textContent = `大小 ${formatSize(totalSize)}`;
+  } else if (state.currentView === 'series') {
+    // 剧集概览页：显示剧集数量和总大小
+    statTotal.textContent = `${state.totalCount} 个剧集`;
+    statSeries.classList.add('hidden');
+    // 计算所有剧集的总大小
+    let totalSize = 0;
+    state.seriesList.forEach(s => {
+      totalSize += s.total_size || 0;
+    });
+    statSize.textContent = `总大小 ${formatSize(totalSize)}`;
+  } else if (state.currentView === 'all') {
+    // 电影页：显示电影数量和大小，隐藏剧集统计
+    statTotal.textContent = `${state.totalCount} 部电影`;
+    statSeries.classList.add('hidden');
+    // 计算当前列表（电影）的总大小
+    let totalSize = 0;
+    state.videos.forEach(v => {
+      const video = v.video || v;
+      totalSize += video.file_size || 0;
+    });
+    statSize.textContent = `总大小 ${formatSize(totalSize)}`;
+  } else {
+    // 其他视图（收藏夹、历史等）：显示视频数量
+    statTotal.textContent = `${state.totalCount} 个视频`;
+    statSeries.classList.add('hidden');
+    // 计算当前列表的总大小
+    let totalSize = 0;
+    state.videos.forEach(v => {
+      const video = v.video || v;
+      totalSize += video.file_size || 0;
+    });
+    statSize.textContent = `总大小 ${formatSize(totalSize)}`;
+  }
 }
 
 function updateStatsDisplay(stats) {
   document.getElementById('count-all').textContent = stats.movie_count;
   document.getElementById('count-fav').textContent = stats.favorites_count;
   document.getElementById('count-series').textContent = stats.total_series;
-  document.getElementById('stat-series').textContent = `${stats.total_series} 个剧集`;
-  document.getElementById('stat-size').textContent = `总大小 ${formatSize(stats.total_size)}`;
+  // 注意：stat-series 和 stat-size 现在由 updateStats() 根据当前视图动态更新
+  // 这里不再设置它们，避免显示全局统计
 }
 
 // ============================================
@@ -968,6 +1026,43 @@ async function startScan() {
   }
 }
 
+// 刷新所有扫描位置
+async function refreshAllScans() {
+  const btn = document.getElementById('btn-refresh');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const span = btn.querySelector('span');
+  const originalText = span.textContent;
+  span.textContent = '刷新中...';
+
+  try {
+    const result = await invoke('refresh_all_scans', { defaultWatched: false });
+    const parts = [];
+    if (result.removed > 0) parts.push(`移除 ${result.removed} 个失效记录`);
+    if (result.new_added > 0) parts.push(`新增 ${result.new_added} 个视频`);
+    if (result.folders_scanned > 0) parts.push(`扫描 ${result.folders_scanned} 个文件夹`);
+
+    if (parts.length > 0) {
+      showToast('刷新完成：' + parts.join('，'));
+    } else {
+      showToast('刷新完成，无变化');
+    }
+
+    if (result.errors.length > 0) {
+      console.warn('刷新错误:', result.errors);
+    }
+
+    fetchVideos();
+    fetchTags();
+    fetchStats();
+  } catch (e) {
+    showToast('刷新失败: ' + e, 'error');
+  } finally {
+    btn.disabled = false;
+    span.textContent = originalText;
+  }
+}
+
 // ============================================
 // 标签管理对话框
 // ============================================
@@ -1120,6 +1215,9 @@ function bindEvents() {
 
   // 扫描
   document.getElementById('btn-scan').addEventListener('click', openScanDialog);
+
+  // 刷新
+  document.getElementById('btn-refresh').addEventListener('click', refreshAllScans);
   document.getElementById('btn-browse-scan').onclick = async function() {
     try {
       var selected = await open({ directory: true, multiple: false });
@@ -1245,12 +1343,20 @@ function bindEvents() {
     }
   });
 
-  // 返回剧集列表
+  // 返回剧集列表（详情对话框中的按钮）
   document.getElementById('btn-back-series').onclick = function() {
     state.currentView = 'series';
     document.getElementById('video-modal').classList.add('hidden');
     fetchVideos();
   };
+
+  // 面包屑导航：返回剧集概览
+  function goBackToSeriesOverview() {
+    state.currentView = 'series';
+    fetchVideos();
+  }
+  document.getElementById('btn-back-series-overview').onclick = goBackToSeriesOverview;
+  document.getElementById('breadcrumb-parent').onclick = goBackToSeriesOverview;
 
   // 全剧已看过
   document.getElementById('btn-mark-series-watched').onclick = async function() {

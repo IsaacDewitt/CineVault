@@ -40,6 +40,8 @@ pub fn scan_videos(
 
     // #2: 空扫描安全处理
     if total_found == 0 {
+        // 即使没有新视频，也记录扫描路径（更新 last_scanned_at）
+        let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
         return Ok(ScanResult {
             total_found: 0,
             new_added: 0,
@@ -456,6 +458,8 @@ pub fn scan_series(
 
     let total_found = video_files.len() as i64;
     if total_found == 0 {
+        // 即使没有新视频，也记录扫描路径（更新 last_scanned_at）
+        let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
         return Ok(ScanResult { total_found: 0, new_added: 0, updated: 0, errors: Vec::new(), series_detected: Vec::new() });
     }
 
@@ -723,4 +727,98 @@ pub fn get_scan_folders(db: State<'_, DbConn>) -> Result<Vec<ScanFolder>, String
 pub fn delete_scan_folder(db: State<'_, DbConn>, folder_id: i64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::delete_scan_folder(&conn, folder_id).map_err(|e| e.to_string())
+}
+
+/// 刷新所有已扫描文件夹
+/// 1. 检查数据库中所有视频文件是否存在，删除不存在的记录
+/// 2. 对已扫描文件夹执行增量扫描，添加新视频
+#[tauri::command]
+pub fn refresh_all_scans(
+    db: State<'_, DbConn>,
+    default_watched: bool,
+) -> Result<RefreshResult, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+
+    // 清空目录缓存
+    scanner::clear_dir_cache();
+
+    // 1. 获取所有已扫描文件夹
+    let scan_folders = crate::db::get_scan_folders(&conn).map_err(|e| e.to_string())?;
+
+    // 2. 检查所有视频文件是否存在
+    let mut stmt = conn
+        .prepare("SELECT id, file_path FROM videos")
+        .map_err(|e| AppError::db(e.to_string()))?;
+
+    let videos: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| AppError::db(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut removed: i64 = 0;
+    let mut errors = Vec::new();
+
+    // 删除不存在的视频记录
+    conn.execute_batch("BEGIN").map_err(|e| AppError::db(e.to_string()))?;
+    for (id, file_path) in &videos {
+        if !Path::new(file_path).exists() {
+            match conn.execute("DELETE FROM videos WHERE id = ?1", rusqlite::params![id]) {
+                Ok(_) => removed += 1,
+                Err(e) => errors.push(format!("删除记录失败 ({}): {}", file_path, e)),
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").map_err(|e| AppError::db(e.to_string()))?;
+
+    // 3. 对每个已扫描文件夹执行增量扫描
+    let mut new_added: i64 = 0;
+    let folders_scanned = scan_folders.len() as i64;
+
+    for folder in &scan_folders {
+        // 获取当前数据库中的文件路径（用于增量扫描）
+        let mut stmt = conn
+            .prepare("SELECT file_path FROM videos")
+            .map_err(|e| AppError::db(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| AppError::db(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let video_files = scanner::scan_directory_incremental(&folder.folder_path, &existing);
+
+        conn.execute_batch("BEGIN").map_err(|e| AppError::db(e.to_string()))?;
+        for file in &video_files {
+            let info = scanner::extract_video_info(file);
+            let vtype = if info.series_name.is_some() { "episode" } else { "movie" };
+
+            match crate::db::upsert_video(
+                &conn,
+                &info.title,
+                &info.file_path,
+                &info.file_name,
+                info.file_size,
+                vtype,
+                info.series_name.as_deref(),
+                info.season,
+                info.episode,
+                default_watched,
+            ) {
+                Ok(_) => new_added += 1,
+                Err(e) => errors.push(format!("{}: {}", info.file_path, e)),
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|e| AppError::db(e.to_string()))?;
+
+        // 更新扫描文件夹记录
+        let _ = crate::db::upsert_scan_folder(&conn, &folder.folder_path);
+    }
+
+    Ok(RefreshResult {
+        removed,
+        new_added,
+        folders_scanned,
+        errors,
+    })
 }

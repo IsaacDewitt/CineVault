@@ -169,6 +169,15 @@ pub struct ScanFolder {
     pub last_scanned_at: String,
 }
 
+/// 刷新结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResult {
+    pub removed: i64,
+    pub new_added: i64,
+    pub folders_scanned: i64,
+    pub errors: Vec<String>,
+}
+
 /// #1/#7: upsert_video 返回值，区分插入和更新
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpsertResult {

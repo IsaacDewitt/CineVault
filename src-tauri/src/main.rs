@@ -83,6 +83,7 @@ fn main() {
             commands::get_drives,
             commands::get_scan_folders,
             commands::delete_scan_folder,
+            commands::refresh_all_scans,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
