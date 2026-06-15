@@ -336,6 +336,14 @@ function renderVideos() {
   container.querySelectorAll('.video-card').forEach(card => {
     card.addEventListener('click', () => {
       const id = parseInt(card.dataset.id);
+      // 将点击的卡片移到最前面
+      container.insertBefore(card, container.firstChild);
+      // 同步更新 state.videos 数组顺序
+      const idx = state.videos.findIndex(v => (v.video || v).id === id);
+      if (idx > 0) {
+        var item = state.videos.splice(idx, 1)[0];
+        state.videos.unshift(item);
+      }
       openVideoDetail(id);
     });
   });
@@ -384,8 +392,20 @@ function renderSeriesOverview() {
   // 点击进入剧集详情
   container.querySelectorAll('.video-card[data-series]').forEach(function(card) {
     card.onclick = function() {
+      // 将点击的剧集卡片移到最前面
+      container.insertBefore(card, container.firstChild);
+      // 同步更新 state.seriesList 数组顺序
+      var seriesName = card.dataset.series;
+      var idx = -1;
+      for (var i = 0; i < state.seriesList.length; i++) {
+        if (state.seriesList[i].name === seriesName) { idx = i; break; }
+      }
+      if (idx > 0) {
+        var item = state.seriesList.splice(idx, 1)[0];
+        state.seriesList.unshift(item);
+      }
       state.currentView = 'series-episodes';
-      state.currentSeries = card.dataset.series;
+      state.currentSeries = seriesName;
       fetchVideos();
     };
   });
@@ -430,25 +450,17 @@ function renderHistory(history) {
 
   emptyState.classList.add('hidden');
   container.innerHTML = history.map(h => `
-    <div class="video-card" data-id="${h.video_id}">
-      <div class="video-thumb">
-        <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
-          <path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/>
-        </svg>
-      </div>
-      <div class="video-info">
-        <div class="video-title">${h.video_title || '未知'}</div>
-        <div class="video-meta">
-          <span>观看于 ${new Date(h.watched_at).toLocaleString('zh-CN')}</span>
-          <span>${(h.progress * 100).toFixed(0)}%</span>
-        </div>
-      </div>
+    <div class="video-card history-card" data-id="${h.video_id}">
+      <div class="video-card-title">${h.video_title || '未知'}</div>
+      <div class="video-card-meta">观看于 ${new Date(h.watched_at).toLocaleString('zh-CN')}</div>
     </div>
   `).join('');
 
   container.querySelectorAll('.video-card').forEach(card => {
     card.addEventListener('click', () => {
       const id = parseInt(card.dataset.id);
+      // 将点击的卡片移到最前面
+      container.insertBefore(card, container.firstChild);
       openVideoDetail(id);
     });
   });
