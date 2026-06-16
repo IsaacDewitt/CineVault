@@ -647,6 +647,26 @@ body {
   margin-top: 0;
 }
 
+.history-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.history-card .video-card-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 0;
+}
+.history-card .video-card-meta {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.history-card {
+  grid-column: 1 / -1;
+}
+
 /* ============================================
    Empty State
    ============================================ */
