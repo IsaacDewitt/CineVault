@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/movies/main/tauri.conf.json",
   "productName": "MovieUI",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "identifier": "com.movieui.app",
   "build": {
     "frontendDist": "../dist",
