@@ -23,6 +23,7 @@ const state = {
   loading: false,
   seriesList: [],
   currentSeries: '',
+  lastClickedSeries: null,
 };
 
 // 拖拽状态
@@ -169,6 +170,18 @@ async function fetchVideos(append = false) {
             case 'updated':
             default:
               filtered.sort(function(a, b) { return new Date(b.updated_at || 0) - new Date(a.updated_at || 0); });
+          }
+
+          // 将上次点击的剧集移到最前面
+          if (state.lastClickedSeries) {
+            var clickedIdx = -1;
+            for (var ci = 0; ci < filtered.length; ci++) {
+              if (filtered[ci].name === state.lastClickedSeries) { clickedIdx = ci; break; }
+            }
+            if (clickedIdx > 0) {
+              var clickedItem = filtered.splice(clickedIdx, 1)[0];
+              filtered.unshift(clickedItem);
+            }
           }
 
           state.seriesList = filtered;
@@ -392,18 +405,9 @@ function renderSeriesOverview() {
   // 点击进入剧集详情
   container.querySelectorAll('.video-card[data-series]').forEach(function(card) {
     card.onclick = function() {
-      // 将点击的剧集卡片移到最前面
-      container.insertBefore(card, container.firstChild);
-      // 同步更新 state.seriesList 数组顺序
       var seriesName = card.dataset.series;
-      var idx = -1;
-      for (var i = 0; i < state.seriesList.length; i++) {
-        if (state.seriesList[i].name === seriesName) { idx = i; break; }
-      }
-      if (idx > 0) {
-        var item = state.seriesList.splice(idx, 1)[0];
-        state.seriesList.unshift(item);
-      }
+      // 记住点击的剧集，返回时置顶
+      state.lastClickedSeries = seriesName;
       state.currentView = 'series-episodes';
       state.currentSeries = seriesName;
       fetchVideos();
