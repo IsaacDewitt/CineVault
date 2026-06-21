@@ -1440,6 +1440,8 @@ function bindEvents() {
       document.getElementById('search-input').value = '';
       updateNavActive();
       highlightSelectedTags();
+      // 侧边栏导航时隐藏剧集面包屑（退出 series-episodes 子视图）
+      document.getElementById('series-breadcrumb').classList.add('hidden');
 
       if (state.currentView === 'history') {
         fetchHistory();
