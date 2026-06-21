@@ -538,7 +538,8 @@ pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, App
                 WHERE vt.video_id = v.id AND t.name = '已看过'
             ) THEN 1 ELSE 0 END) as watched,
             COALESCE(SUM(v.file_size), 0),
-            COALESCE(AVG(CASE WHEN v.rating > 0 THEN v.rating END), 0)
+            COALESCE(AVG(CASE WHEN v.rating > 0 THEN v.rating END), 0),
+            MAX(v.last_watched_at)
          FROM videos v
          WHERE v.video_type = 'episode'
          GROUP BY COALESCE(v.series_name, '')
@@ -551,8 +552,9 @@ pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, App
         let watched: i64 = row.get(2)?;
         let total_size: i64 = row.get(3)?;
         let rating: f64 = row.get(4)?;
+        let last_watched_at: Option<String> = row.get(5)?;
         let progress = if total > 0 { watched as f64 / total as f64 } else { 0.0 };
-        Ok(SeriesOverview { name, total_episodes: total, watched_episodes: watched, progress, total_size, rating })
+        Ok(SeriesOverview { name, total_episodes: total, watched_episodes: watched, progress, total_size, rating, last_watched_at })
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(series)

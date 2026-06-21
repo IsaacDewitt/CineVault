@@ -47,6 +47,4 @@
 - 保持项目干净：没有多余临时产物，没有无意义格式化，没有无关文件混入。
 
 
-docker run -d -p 3000:8080 --add-host=host.docker.internal:host-gateway \
-    -e OLLAMA_BASE_URL=http://192.168.10.106:11434 \
-    ghcr.io/open-webui/open-webui:main
+

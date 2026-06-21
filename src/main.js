@@ -13,7 +13,7 @@ const state = {
   previousView: 'all',
   selectedTagIds: [],
   viewMode: 'grid',
-  sortBy: 'updated',
+  sortBy: 'last_watched',
   ratingFilter: 0,
   searchQuery: '',
   selectedVideoId: null,
@@ -168,8 +168,11 @@ async function fetchVideos(append = false) {
               filtered.sort(function(a, b) { return (b.rating || 0) - (a.rating || 0); });
               break;
             case 'updated':
-            default:
               filtered.sort(function(a, b) { return new Date(b.updated_at || 0) - new Date(a.updated_at || 0); });
+              break;
+            case 'last_watched':
+            default:
+              filtered.sort(function(a, b) { return new Date(b.last_watched_at || 0) - new Date(a.last_watched_at || 0); });
           }
 
           // 将上次点击的剧集移到最前面
@@ -309,8 +312,11 @@ function applyFilters() {
       videos.sort((a, b) => (getVideo(b).rating || 0) - (getVideo(a).rating || 0));
       break;
     case 'updated':
-    default:
       videos.sort((a, b) => new Date(getVideo(b).updated_at || 0) - new Date(getVideo(a).updated_at || 0));
+      break;
+    case 'last_watched':
+    default:
+      videos.sort((a, b) => new Date(getVideo(b).last_watched_at || 0) - new Date(getVideo(a).last_watched_at || 0));
   }
 
   state.videos = videos;

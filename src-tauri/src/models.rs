@@ -148,6 +148,7 @@ pub struct SeriesOverview {
     pub progress: f64,
     pub total_size: i64,
     pub rating: f64,
+    pub last_watched_at: Option<String>,
 }
 
 /// 分页查询结果
