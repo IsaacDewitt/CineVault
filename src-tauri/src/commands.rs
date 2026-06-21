@@ -218,6 +218,13 @@ pub fn get_history(db: State<'_, DbConn>, limit: Option<i64>) -> Result<Vec<Watc
     crate::db::get_watch_history(&conn, limit.unwrap_or(50)).map_err(|e| e.to_string())
 }
 
+/// 根据 ID 获取单个视频详情（含标签）
+#[tauri::command]
+pub fn get_video_detail(db: State<'_, DbConn>, video_id: i64) -> Result<VideoWithTags, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::get_video_by_id(&conn, video_id).map_err(|e| e.to_string())
+}
+
 /// 获取所有标签
 #[tauri::command]
 pub fn get_tags(db: State<'_, DbConn>) -> Result<Vec<Tag>, String> {

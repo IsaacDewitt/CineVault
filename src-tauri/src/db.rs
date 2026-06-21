@@ -283,12 +283,17 @@ pub fn update_watch_progress(conn: &Connection, video_id: i64, progress: f64) ->
     }
 }
 
-/// 获取播放历史
+/// 获取播放历史（每个视频只保留最近一次记录）
 pub fn get_watch_history(conn: &Connection, limit: i64) -> Result<Vec<WatchHistory>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT h.id, h.video_id, h.watched_at, h.progress, v.title, v.file_path
-         FROM watch_history h
+         FROM (
+             SELECT id, video_id, watched_at, progress,
+                    ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY watched_at DESC) as rn
+             FROM watch_history
+         ) h
          LEFT JOIN videos v ON h.video_id = v.id
+         WHERE h.rn = 1
          ORDER BY h.watched_at DESC LIMIT ?1"
     )?;
 
@@ -304,6 +309,32 @@ pub fn get_watch_history(conn: &Connection, limit: i64) -> Result<Vec<WatchHisto
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(history)
+}
+
+/// 根据 ID 获取单个视频（含标签）
+pub fn get_video_by_id(conn: &Connection, video_id: i64) -> Result<VideoWithTags, AppError> {
+    let sql = format!(
+        "SELECT
+            v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating,
+            v.is_favorite, v.video_type, v.series_name, v.season, v.episode, v.thumbnail_path,
+            v.last_watched_at, v.watch_progress, v.created_at, v.updated_at,
+            GROUP_CONCAT(t.id || '\x1F' || t.name || '\x1F' || t.color, '\x1E')
+         FROM videos v
+         LEFT JOIN video_tags vt ON v.id = vt.video_id
+         LEFT JOIN tags t ON vt.tag_id = t.id
+         WHERE v.id = ?1
+         GROUP BY v.id"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let result = stmt.query_row(params![video_id], |row| {
+        let video = row_to_video(row)?;
+        let tags_str: Option<String> = row.get(17)?;
+        let tags = parse_tags_string(tags_str);
+        Ok(VideoWithTags { video, tags })
+    })?;
+
+    Ok(result)
 }
 
 /// 获取所有标签（含视频数量）

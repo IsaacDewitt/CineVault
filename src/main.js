@@ -272,6 +272,10 @@ async function fetchHistory() {
   try {
     const history = await invoke('get_history', { limit: 50 });
     renderHistory(history || []);
+    // 同步更新 totalCount 以显示正确的统计
+    state.totalCount = (history || []).length;
+    state.videos = [];
+    updateStats();
   } catch (e) {
     console.error('获取历史失败:', e);
   }
@@ -467,10 +471,19 @@ function renderHistory(history) {
   `).join('');
 
   container.querySelectorAll('.video-card').forEach(card => {
-    card.addEventListener('click', () => {
+    card.addEventListener('click', async () => {
       const id = parseInt(card.dataset.id);
       // 将点击的卡片移到最前面
       container.insertBefore(card, container.firstChild);
+      // 从后端获取完整视频数据（历史视图下 state.videos 为空）
+      try {
+        const videoData = await invoke('get_video_detail', { videoId: id });
+        if (!state.videos.find(v => (v.video || v).id === id)) {
+          state.videos.push(videoData);
+        }
+      } catch (e) {
+        console.error('获取视频详情失败:', e);
+      }
       openVideoDetail(id);
     });
   });

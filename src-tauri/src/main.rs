@@ -59,6 +59,7 @@ fn main() {
             commands::toggle_favorite,
             commands::update_progress,
             commands::get_history,
+            commands::get_video_detail,
             commands::get_tags,
             commands::create_tag,
             commands::delete_tag,
