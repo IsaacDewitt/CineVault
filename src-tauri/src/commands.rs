@@ -225,11 +225,11 @@ pub fn get_video_detail(db: State<'_, DbConn>, video_id: i64) -> Result<VideoWit
     crate::db::get_video_by_id(&conn, video_id).map_err(|e| e.to_string())
 }
 
-/// 获取所有标签
+/// 获取所有标签（可按 video_type 过滤计数）
 #[tauri::command]
-pub fn get_tags(db: State<'_, DbConn>) -> Result<Vec<Tag>, String> {
+pub fn get_tags(db: State<'_, DbConn>, video_type: Option<String>) -> Result<Vec<Tag>, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    crate::db::get_all_tags(&conn).map_err(|e| e.to_string())
+    crate::db::get_all_tags(&conn, video_type.as_deref()).map_err(|e| e.to_string())
 }
 
 /// 创建标签

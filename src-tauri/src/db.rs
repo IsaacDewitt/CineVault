@@ -337,24 +337,44 @@ pub fn get_video_by_id(conn: &Connection, video_id: i64) -> Result<VideoWithTags
     Ok(result)
 }
 
-/// 获取所有标签（含视频数量）
-pub fn get_all_tags(conn: &Connection) -> Result<Vec<Tag>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, COUNT(vt.video_id) as video_count
-         FROM tags t LEFT JOIN video_tags vt ON t.id = vt.tag_id
-         GROUP BY t.id ORDER BY t.sort_order, t.name"
-    )?;
-
-    let tags = stmt.query_map([], |row| {
-        Ok(Tag {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            color: row.get(2)?,
-            video_count: Some(row.get(3)?),
-        })
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
-
-    Ok(tags)
+/// 获取所有标签（含视频数量，可按 video_type 过滤计数）
+pub fn get_all_tags(conn: &Connection, video_type: Option<&str>) -> Result<Vec<Tag>, AppError> {
+    if let Some(vtype) = video_type {
+        // 按视频类型过滤：只统计指定类型的视频
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, t.color,
+                    (SELECT COUNT(*) FROM video_tags vt
+                     INNER JOIN videos v ON vt.video_id = v.id
+                     WHERE vt.tag_id = t.id AND v.video_type = ?1) as video_count
+             FROM tags t
+             ORDER BY t.sort_order, t.name"
+        )?;
+        let tags = stmt.query_map(params![vtype], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                video_count: Some(row.get(3)?),
+            })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tags)
+    } else {
+        // 不区分类型：统计所有视频
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, t.color, COUNT(vt.video_id) as video_count
+             FROM tags t LEFT JOIN video_tags vt ON t.id = vt.tag_id
+             GROUP BY t.id ORDER BY t.sort_order, t.name"
+        )?;
+        let tags = stmt.query_map([], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                video_count: Some(row.get(3)?),
+            })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tags)
+    }
 }
 
 /// 创建标签

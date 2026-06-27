@@ -259,9 +259,23 @@ async function fetchVideos(append = false) {
   }
 }
 
+function getVideoTypeForView() {
+  // 根据当前视图返回对应的视频类型，null 表示不限类型
+  switch (state.currentView) {
+    case 'all':
+      return 'movie';
+    case 'series':
+    case 'series-episodes':
+      return 'episode';
+    default:
+      return null;
+  }
+}
+
 async function fetchTags() {
   try {
-    state.tags = await invoke('get_tags') || [];
+    var videoType = getVideoTypeForView();
+    state.tags = await invoke('get_tags', { videoType: videoType }) || [];
     renderTags();
   } catch (e) {
     console.error('获取标签失败:', e);
@@ -1442,6 +1456,8 @@ function bindEvents() {
       highlightSelectedTags();
       // 侧边栏导航时隐藏剧集面包屑（退出 series-episodes 子视图）
       document.getElementById('series-breadcrumb').classList.add('hidden');
+      // 切换视图时重新加载标签计数（按电影/剧集分开统计）
+      fetchTags();
 
       if (state.currentView === 'history') {
         fetchHistory();
