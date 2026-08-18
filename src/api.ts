@@ -1,0 +1,127 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  ExportData,
+  ImportResult,
+  MigrationResult,
+  PaginatedVideos,
+  PendingItem,
+  RefreshResult,
+  ScanFolder,
+  ScanResult,
+  SeriesOverview,
+  Tag,
+  VideoKind,
+  VideoStats,
+  VideoWithTags,
+  WatchHistory,
+} from "./types";
+
+// ============================================
+// 后端调用封装
+// ============================================
+
+export const api = {
+  // 扫描
+  scanFolder: (dirPath: string, incremental: boolean, defaultWatched: boolean) =>
+    invoke<ScanResult>("scan_folder", { dirPath, incremental, defaultWatched }),
+  refreshAllScans: (defaultWatched: boolean) =>
+    invoke<RefreshResult>("refresh_all_scans", { defaultWatched }),
+
+  // 查询
+  getVideos: (p: {
+    page?: number;
+    pageSize?: number;
+    query?: string;
+    kind?: string;
+    tagIds?: number[];
+    favoritesOnly?: boolean;
+    minRating?: number;
+    sort?: string;
+    watchStatus?: string;
+  }) =>
+    invoke<PaginatedVideos>("get_videos", {
+      page: p.page ?? 0,
+      pageSize: p.pageSize ?? 60,
+      query: p.query ?? "",
+      kind: p.kind ?? "all",
+      tagIds: p.tagIds ?? [],
+      favoritesOnly: p.favoritesOnly ?? false,
+      minRating: p.minRating ?? 0,
+      sort: p.sort ?? "last_watched",
+      watchStatus: p.watchStatus ?? "all",
+    }),
+  getRecentlyAdded: (page = 0, pageSize = 60) =>
+    invoke<PaginatedVideos>("get_recently_added", { page, pageSize }),
+  getSeriesOverview: () => invoke<SeriesOverview[]>("get_series_overview"),
+  getSeriesEpisodes: (seriesId: number) =>
+    invoke<VideoWithTags[]>("get_series_episodes", { seriesId }),
+  getVideoDetail: (videoId: number) =>
+    invoke<VideoWithTags>("get_video_detail", { videoId }),
+  getHistory: (limit = 60) => invoke<WatchHistory[]>("get_history", { limit }),
+  getStats: () => invoke<VideoStats>("get_stats"),
+
+  // 标签
+  getTags: () => invoke<Tag[]>("get_tags"),
+  createTag: (name: string, color: string) =>
+    invoke<Tag>("create_tag", { name, color }),
+  updateTag: (tagId: number, name: string | null, color: string | null) =>
+    invoke("update_tag", { tagId, name, color }),
+  deleteTag: (tagId: number) => invoke("delete_tag", { tagId }),
+  addVideoTag: (videoId: number, tagId: number) =>
+    invoke("add_video_tag", { videoId, tagId }),
+  removeVideoTag: (videoId: number, tagId: number) =>
+    invoke("remove_video_tag", { videoId, tagId }),
+  addSeriesTag: (seriesId: number, tagId: number) =>
+    invoke("add_series_tag", { seriesId, tagId }),
+  removeSeriesTag: (seriesId: number, tagId: number) =>
+    invoke("remove_series_tag", { seriesId, tagId }),
+
+  // 操作
+  setRating: (videoId: number, rating: number) =>
+    invoke("set_rating", { videoId, rating }),
+  setSeriesRating: (seriesId: number, rating: number) =>
+    invoke("set_series_rating", { seriesId, rating }),
+  toggleFavorite: (videoId: number) =>
+    invoke<boolean>("toggle_favorite", { videoId }),
+  toggleSeriesFavorite: (seriesId: number) =>
+    invoke<boolean>("toggle_series_favorite", { seriesId }),
+  markSeriesWatched: (seriesId: number, watched: boolean) =>
+    invoke<number>("mark_series_watched", { seriesId, watched }),
+  updateProgress: (videoId: number, progress: number) =>
+    invoke("update_progress", { videoId, progress }),
+  openFile: (path: string) => invoke("open_file", { path }),
+  openFolder: (path: string) => invoke("open_folder", { path }),
+  renameVideo: (videoId: number, newTitle: string) =>
+    invoke("rename_video", { videoId, newTitle }),
+  renameSeries: (seriesId: number, newName: string) =>
+    invoke("rename_series", { seriesId, newName }),
+  deleteVideo: (videoId: number) => invoke("delete_video", { videoId }),
+  deleteSeries: (seriesId: number) => invoke("delete_series", { seriesId }),
+  deleteVideoWithFile: (videoId: number) =>
+    invoke<string>("delete_video_with_file", { videoId }),
+
+  // 待确认
+  getPending: () => invoke<PendingItem[]>("get_pending"),
+  resolvePending: (videoId: number, kind: VideoKind, seriesName: string | null) =>
+    invoke("resolve_pending", { videoId, kind, seriesName }),
+
+  // 扫描目录
+  getScanFolders: () => invoke<ScanFolder[]>("get_scan_folders"),
+  deleteScanFolder: (folderId: number) =>
+    invoke("delete_scan_folder", { folderId }),
+
+  // 迁移
+  checkMigration: () => invoke<string | null>("check_migration"),
+  migrateFromOld: (oldPath: string | null) =>
+    invoke<MigrationResult>("migrate_from_old", { oldPath }),
+
+  // 导出 / 导入
+  exportJson: () => invoke<ExportData>("export_json"),
+  importJson: (jsonStr: string) => invoke<ImportResult>("import_json", { jsonStr }),
+  readTextFile: (filePath: string) => invoke<string>("read_text_file", { filePath }),
+  writeTextFile: (filePath: string, content: string) =>
+    invoke("write_text_file", { filePath, content }),
+
+  // 系统
+  getDrives: () => invoke<{ letter: string; path: string; label: string }[]>("get_drives"),
+};
