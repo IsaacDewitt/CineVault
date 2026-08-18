@@ -145,7 +145,9 @@ export default function App() {
     fetchPendingCount();
   }, [checkMigration, fetchTags, fetchStats, fetchPendingCount]);
 
-  // 视图/筛选变化 → 重新加载
+  // 搜索框只需更新 query；防抖由下方 useEffect 处理（避免 setTimeout 闭包陷阱）
+  const onQueryChange = (q: string) => setQuery(q);
+
   useEffect(() => {
     if (view === "series") {
       fetchSeries();
@@ -163,20 +165,15 @@ export default function App() {
         })
         .catch((e) => toast.err(String(e)))
         .finally(() => setLoading(false));
+    } else if (query !== "") {
+      // 搜索框防抖：350ms 内无新输入才查库
+      const id = window.setTimeout(() => fetchVideos(0), 350);
+      return () => window.clearTimeout(id);
     } else {
       fetchVideos(0);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, query, kind, selectedTagIds, minRating, sort, watchStatus, fetchVideos, fetchSeries, fetchHistory]);
-
-  // 搜索防抖
-  const onQueryChange = (q: string) => {
-    setQuery(q);
-    window.clearTimeout(debounceRef.current);
-    debounceRef.current = window.setTimeout(() => {
-      if (view !== "series" && view !== "history") fetchVideos(0);
-    }, 350);
-  };
 
   const refreshAll = useCallback(async () => {
     try {
