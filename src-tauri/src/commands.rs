@@ -276,8 +276,27 @@ pub fn get_videos(
 
     let q = query.unwrap_or_default();
     if !q.trim().is_empty() {
-        conditions.push("(v.title LIKE ?1 ESCAPE '\\' OR v.file_name LIKE ?1 ESCAPE '\\')".to_string());
-        params.push(Box::new(format!("%{}%", q.trim())));
+        // 多关键词：按空白拆分，每个词都需命中（AND）
+        // 搜索范围：标题 / 文件名 / 完整路径 / 剧集名 / 标签名
+        let terms: Vec<String> = q
+            .split_whitespace()
+            .map(|t| format!("%{}%", crate::db::escape_like(t)))
+            .collect();
+        if !terms.is_empty() {
+            let mut term_conds = Vec::new();
+            for t in &terms {
+                let idx = params.len() + 1;
+                term_conds.push(format!(
+                    "(v.title LIKE ?{0} ESCAPE '\\' OR v.file_name LIKE ?{0} ESCAPE '\\' \
+                     OR v.file_path LIKE ?{0} ESCAPE '\\' OR s.name LIKE ?{0} ESCAPE '\\' \
+                     OR EXISTS (SELECT 1 FROM video_tags vt_ JOIN tags t_ ON t_.id = vt_.tag_id \
+                                WHERE vt_.video_id = v.id AND t_.name LIKE ?{0} ESCAPE '\\'))",
+                    idx
+                ));
+                params.push(Box::new(t.clone()));
+            }
+            conditions.push(format!("({})", term_conds.join(" AND ")));
+        }
     }
     if let Some(k) = kind {
         let idx = params.len() + 1;

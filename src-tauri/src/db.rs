@@ -1034,6 +1034,6 @@ pub fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, AppError> {
     Ok(out)
 }
 
-fn escape_like(s: &str) -> String {
+pub fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }

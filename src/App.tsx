@@ -264,6 +264,15 @@ export default function App() {
   };
 
   // ===== 渲染 =====
+  // 前端兜底过滤：剧集/历史/最近更新视图不走后端 query，这里按关键词过滤
+  const q = query.trim().toLowerCase();
+  const matchV = (v: VideoWithTags) =>
+    !q ||
+    v.title.toLowerCase().includes(q) ||
+    v.file_name.toLowerCase().includes(q) ||
+    v.file_path.toLowerCase().includes(q);
+  const matchS = (s: SeriesOverview) => !q || s.name.toLowerCase().includes(q);
+
   return (
     <div className="app">
       <Sidebar
@@ -350,7 +359,7 @@ export default function App() {
 
               {view === "series" ? (
                 <SeriesGrid
-                  series={series}
+                  series={series.filter(matchS)}
                   onOpen={(s) => {
                     setCurrentSeries(s);
                     setSelectedTagIds([]);
@@ -360,7 +369,7 @@ export default function App() {
                 />
               ) : view === "history" ? (
                 <VideoList
-                  videos={historyToVideos(history)}
+                  videos={historyToVideos(history).filter(matchV)}
                   onOpen={setDetailVideo}
                   onPlay={play}
                   onChanged={afterDataChange}
@@ -368,7 +377,7 @@ export default function App() {
               ) : (
                 <>
                   <VideoList
-                    videos={videos}
+                    videos={view === "recent" ? videos.filter(matchV) : videos}
                     onOpen={setDetailVideo}
                     onPlay={play}
                     onChanged={afterDataChange}
