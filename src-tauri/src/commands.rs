@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use tauri::State;
 
@@ -124,6 +125,101 @@ pub fn scan_folder(
         updated,
         errors,
         pending,
+    })
+}
+
+/// 添加剧集：选文件夹 → 文件夹名即剧集名，文件夹内**所有**视频强制归集到该剧集
+/// 与 scan_folder 的区别：
+/// - 不走自动分类 / 待确认队列（kind 直接锁定 series）
+/// - 同名剧集并入，folder_path 记录完整路径
+/// - 不注册进 scan_folders（避免日后刷新被分类器重新判定拆散）
+#[tauri::command]
+pub fn add_series_from_folder(
+    db: State<'_, DbConn>,
+    dir_path: String,
+    default_watched: bool,
+) -> Result<ScanResult, String> {
+    let dir = Path::new(&dir_path);
+    if !dir.is_dir() {
+        return Err(format!("不是有效的文件夹: {}", dir_path));
+    }
+    let Some(series_name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return Err("无法从文件夹路径获取剧集名".to_string());
+    };
+    if series_name.trim().is_empty() {
+        return Err("文件夹名不能为空".to_string());
+    }
+
+    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    let (all_files, scan_errors) = scanner::scan_directory_reporting(&dir_path);
+    let total_found = all_files.len() as i64;
+    if total_found == 0 {
+        return Ok(ScanResult {
+            total_found: 0,
+            new_added: 0,
+            updated: 0,
+            errors: scan_errors,
+            pending: Vec::new(),
+        });
+    }
+
+    let sibling_map = scanner::build_sibling_map_public(&all_files);
+    let mut new_added: i64 = 0;
+    let mut updated: i64 = 0;
+    let mut errors = scan_errors;
+
+    {
+        let tx = conn.transaction().map_err(|e| AppError::db(e.to_string()))?;
+        // 文件夹名 = 剧集名（同名并入），folder_path 记录完整路径
+        let sid = crate::db::upsert_series(&tx, series_name, Some(&dir_path)).map_err(|e| e.to_string())?;
+
+        for file in &all_files {
+            let info = scanner::extract_video_info(file, &sibling_map);
+            // 强制归集：kind=series + user_kind=series（锁定防重判）+ series_id=本剧集
+            match crate::db::upsert_video(
+                &tx,
+                &VideoUpsertParams {
+                    title: &info.title,
+                    file_path: &info.file_path,
+                    file_name: &info.file_name,
+                    file_size: info.file_size,
+                    duration: None,
+                    kind: "series",
+                    confidence: 100,
+                    user_kind: Some("series"),
+                    series_id: Some(sid),
+                    season: info.season,
+                    episode: info.episode,
+                    default_watched,
+                },
+                true,
+            ) {
+                Ok(r) => {
+                    let id = r.id();
+                    if r.is_inserted() {
+                        new_added += 1;
+                    } else {
+                        updated += 1;
+                    }
+                    // 强制归集兜底：移动匹配分支可能保留旧 series_id / 旧 user_kind，一律改挂本剧集
+                    tx.execute(
+                        "UPDATE videos SET series_id = ?1, kind = 'series', user_kind = 'series', updated_at = datetime('now','localtime') WHERE id = ?2",
+                        rusqlite::params![sid, id],
+                    )
+                    .map_err(|e| AppError::db(e.to_string()))?;
+                }
+                Err(e) => errors.push(format!("{}: {}", info.file_path, e)),
+            }
+        }
+        tx.commit().map_err(|e| AppError::db(e.to_string()))?;
+    }
+
+    Ok(ScanResult {
+        total_found,
+        new_added,
+        updated,
+        errors,
+        pending: Vec::new(),
     })
 }
 
@@ -497,6 +593,64 @@ pub fn open_file(path: String) -> Result<(), String> {
         return Err(format!("文件不存在: {}", path));
     }
     open::that(&path).map_err(|e| e.to_string())
+}
+
+/// 解析 PotPlayer 播放列表 dpl，把最近播放位置回填到 watch_progress
+/// 只升不降（避免覆盖已看 / 手动进度）；不碰 last_watched_at
+#[tauri::command]
+pub fn sync_progress_from_player(db: State<'_, DbConn>) -> Result<i64, String> {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let dpl = Path::new(&appdata)
+        .join("PotPlayerMini64")
+        .join("Playlist")
+        .join("PotPlayerMini64.dpl");
+    if !dpl.exists() {
+        return Ok(0);
+    }
+    let content = std::fs::read_to_string(&dpl).map_err(|e| e.to_string())?;
+
+    // 聚合列表项：N*file*path / N*start*ms / N*duration2*ms
+    #[derive(Default)]
+    struct Entry {
+        file: Option<String>,
+        start_ms: Option<u64>,
+        duration_ms: Option<u64>,
+    }
+    let mut entries: HashMap<u32, Entry> = HashMap::new();
+    for line in content.lines() {
+        let Some(star) = line.find('*') else { continue };
+        let Ok(idx) = line[..star].parse::<u32>() else { continue };
+        let rest = &line[star + 1..];
+        let e = entries.entry(idx).or_default();
+        if let Some(p) = rest.strip_prefix("file*") {
+            e.file = Some(p.to_string());
+        } else if let Some(p) = rest.strip_prefix("start*") {
+            e.start_ms = p.trim().parse().ok();
+        } else if let Some(p) = rest.strip_prefix("duration2*") {
+            e.duration_ms = p.trim().parse().ok();
+        }
+    }
+
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    let mut updated: i64 = 0;
+    for e in entries.values() {
+        let (Some(path), Some(start), Some(dur)) = (&e.file, e.start_ms, e.duration_ms) else {
+            continue;
+        };
+        if start == 0 || dur == 0 {
+            continue;
+        }
+        let progress = ((start as f64) / (dur as f64) * 100.0).clamp(0.0, 100.0);
+        let n = conn
+            .execute(
+                "UPDATE videos SET watch_progress = ?1, updated_at = datetime('now','localtime')
+                 WHERE file_path = ?2 COLLATE NOCASE AND watch_progress < ?1",
+                rusqlite::params![progress, path],
+            )
+            .map_err(|e| e.to_string())?;
+        updated += n as i64;
+    }
+    Ok(updated)
 }
 
 #[tauri::command]

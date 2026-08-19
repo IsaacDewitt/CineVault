@@ -18,6 +18,7 @@ import { SeriesGrid } from "./components/SeriesGrid";
 import { SeriesDetailView } from "./components/SeriesDetailView";
 import { DetailModal } from "./components/DetailModal";
 import { ScanModal } from "./components/ScanModal";
+import { AddSeriesModal } from "./components/AddSeriesModal";
 import { PendingModal } from "./components/PendingModal";
 import { TagManager } from "./components/TagManager";
 import { MigrateBanner } from "./components/MigrateBanner";
@@ -53,6 +54,7 @@ export default function App() {
 
   // 弹窗
   const [showScan, setShowScan] = useState(false);
+  const [showAddSeries, setShowAddSeries] = useState(false);
   const [showPending, setShowPending] = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [detailVideo, setDetailVideo] = useState<VideoWithTags | null>(null);
@@ -175,6 +177,17 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, query, kind, selectedTagIds, minRating, sort, watchStatus, fetchVideos, fetchSeries, fetchHistory]);
 
+  // 从 PotPlayer 播放列表回填播放进度（无记录时静默返回 0）
+  const syncPlayerProgress = useCallback(async () => {
+    try {
+      const n = await api.syncProgressFromPlayer();
+      if (n > 0) toast.ok(`已从 PotPlayer 同步 ${n} 条播放进度`);
+    } catch (e) {
+      // 命令不存在等异常不再静默，便于发现版本不匹配
+      toast.err(`进度同步失败：${e}`);
+    }
+  }, []);
+
   const refreshAll = useCallback(async () => {
     try {
       const r = await api.refreshAllScans(false);
@@ -184,11 +197,12 @@ export default function App() {
       if (r.pending.length > 0) {
         toast.ok(`${r.pending.length} 个待确认`);
       }
+      await syncPlayerProgress();
       await Promise.all([fetchVideos(0), fetchSeries(), fetchTags(), fetchStats(), fetchPendingCount()]);
     } catch (e) {
       toast.err(String(e));
     }
-  }, [fetchVideos, fetchSeries, fetchTags, fetchStats, fetchPendingCount]);
+  }, [fetchVideos, fetchSeries, fetchTags, fetchStats, fetchPendingCount, syncPlayerProgress]);
 
   const afterDataChange = useCallback(() => {
     fetchVideos(0);
@@ -199,11 +213,10 @@ export default function App() {
   }, [fetchVideos, fetchSeries, fetchTags, fetchStats, fetchPendingCount]);
 
   // ===== 播放 =====
+  // 交给系统默认播放器（PotPlayer），续播由 PotPlayer 内置记忆位置负责
   const play = async (v: VideoWithTags) => {
     try {
       await api.openFile(v.file_path);
-      await api.updateProgress(v.id, 0);
-      afterDataChange();
     } catch (e) {
       toast.err(String(e));
     }
@@ -292,6 +305,7 @@ export default function App() {
         pendingCount={pendingCount}
         onOpenTagManager={() => setShowTagManager(true)}
         onOpenScan={() => setShowScan(true)}
+        onOpenAddSeries={() => setShowAddSeries(true)}
         onOpenPending={() => setShowPending(true)}
         onExport={doExport}
         onImport={doImport}
@@ -397,7 +411,19 @@ export default function App() {
       {showScan && (
         <ScanModal
           onClose={() => setShowScan(false)}
-          onScanned={afterDataChange}
+          onScanned={() => {
+            syncPlayerProgress();
+            afterDataChange();
+          }}
+        />
+      )}
+      {showAddSeries && (
+        <AddSeriesModal
+          onClose={() => setShowAddSeries(false)}
+          onAdded={() => {
+            syncPlayerProgress();
+            afterDataChange();
+          }}
         />
       )}
       {showPending && (

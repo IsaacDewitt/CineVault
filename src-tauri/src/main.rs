@@ -110,6 +110,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::scan_folder,
+            commands::add_series_from_folder,
             commands::refresh_all_scans,
             commands::get_videos,
             commands::get_recently_added,
@@ -133,6 +134,7 @@ fn main() {
             commands::mark_series_watched,
             commands::update_progress,
             commands::open_file,
+            commands::sync_progress_from_player,
             commands::open_folder,
             commands::rename_video,
             commands::rename_series,

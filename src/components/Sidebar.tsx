@@ -31,6 +31,7 @@ export function Sidebar({
   pendingCount,
   onOpenTagManager,
   onOpenScan,
+  onOpenAddSeries,
   onOpenPending,
   onExport,
   onImport,
@@ -44,6 +45,7 @@ export function Sidebar({
   pendingCount: number;
   onOpenTagManager: () => void;
   onOpenScan: () => void;
+  onOpenAddSeries: () => void;
   onOpenPending: () => void;
   onExport: () => void;
   onImport: () => void;
@@ -151,6 +153,14 @@ export function Sidebar({
       <div style={{ padding: 10, borderTop: "1px solid var(--border)", display: "flex", gap: 6 }}>
         <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onOpenScan}>
           ＋ 扫描
+        </button>
+        <button
+          className="btn btn-ghost"
+          style={{ flex: 1 }}
+          onClick={onOpenAddSeries}
+          title="选一个文件夹，其中所有视频归入同名剧集"
+        >
+          ＋ 剧集
         </button>
       </div>
       <div style={{ padding: "0 10px 10px", display: "flex", gap: 6 }}>

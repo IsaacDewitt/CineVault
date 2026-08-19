@@ -197,27 +197,59 @@ pub fn upsert_video(
         return Ok(UpsertResult::Updated(row));
     }
 
-    // 2. 移动匹配：同文件名（旧文件已不在磁盘）
+    // 2. 移动匹配（两级，旧文件已不在磁盘才认领）：
+    //    2a. 剧集锚点：新文件带剧集归属时，只在本剧集内找同名（文件夹=剧集，杜绝跨剧集重名串记录）
+    //    2b. 全库唯一同名：无歧义时认领，保留历史 series_id 归属（电影移动 / 剧集文件夹改名场景）
     if move_match {
-        let old: Option<(i64, String, Option<i64>, Option<String>)> = tx
-            .query_row(
-                "SELECT id, file_path, series_id, user_kind FROM videos WHERE file_name = ?1 ORDER BY id LIMIT 1",
-                params![p.file_name],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        if let Some((old_id, old_path, old_series, old_user_kind)) = old {
+        if let Some(sid) = p.series_id {
+            let hit: Option<(i64, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT id, file_path, user_kind FROM videos WHERE file_name = ?1 AND series_id = ?2 ORDER BY id LIMIT 1",
+                    params![p.file_name, sid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((old_id, old_path, old_user_kind)) = hit {
+                if old_path != p.file_path && !std::path::Path::new(&old_path).exists() {
+                    tx.execute(
+                        "UPDATE videos SET file_path=?1, title=?2, file_size=?3, series_id=?4,
+                         season=COALESCE(?5, season), episode=COALESCE(?6, episode),
+                         user_kind=COALESCE(user_kind, ?7),
+                         updated_at=datetime('now','localtime') WHERE id=?8",
+                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, old_user_kind, old_id],
+                    )?;
+                    return Ok(UpsertResult::Updated(old_id));
+                }
+            }
+        }
+        // 2b. 全库唯一同名才认领（多条同名 = 有歧义，宁插入不串记录）
+        let same_name: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, file_path, user_kind FROM videos WHERE file_name = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![p.file_name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                if let Ok(x) = r {
+                    v.push(x);
+                }
+            }
+            v
+        };
+        if same_name.len() == 1 {
+            let (old_id, old_path, old_user_kind) = same_name[0].clone();
             if old_path != p.file_path && !std::path::Path::new(&old_path).exists() {
                 tx.execute(
                     "UPDATE videos SET file_path=?1, title=?2, file_size=?3,
-                     series_id=COALESCE(?4, series_id), season=COALESCE(?5, season), episode=COALESCE(?6, episode),
+                     season=COALESCE(?5, season), episode=COALESCE(?6, episode),
                      user_kind=COALESCE(user_kind, ?7),
                      updated_at=datetime('now','localtime') WHERE id=?8",
-                    params![p.file_path, p.title, p.file_size, p.series_id, p.season, p.episode, old_user_kind, old_id],
+                    params![p.file_path, p.title, p.file_size, p.season, p.episode, old_user_kind, old_id],
                 )?;
                 return Ok(UpsertResult::Updated(old_id));
             }
-            let _ = (old_series, old_user_kind);
         }
     }
 

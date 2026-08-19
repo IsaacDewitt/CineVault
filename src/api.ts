@@ -24,6 +24,8 @@ export const api = {
   // 扫描
   scanFolder: (dirPath: string, incremental: boolean, defaultWatched: boolean) =>
     invoke<ScanResult>("scan_folder", { dirPath, incremental, defaultWatched }),
+  addSeriesFromFolder: (dirPath: string, defaultWatched: boolean) =>
+    invoke<ScanResult>("add_series_from_folder", { dirPath, defaultWatched }),
   refreshAllScans: (defaultWatched: boolean) =>
     invoke<RefreshResult>("refresh_all_scans", { defaultWatched }),
 
@@ -90,6 +92,7 @@ export const api = {
   updateProgress: (videoId: number, progress: number) =>
     invoke("update_progress", { videoId, progress }),
   openFile: (path: string) => invoke("open_file", { path }),
+  syncProgressFromPlayer: () => invoke<number>("sync_progress_from_player"),
   openFolder: (path: string) => invoke("open_folder", { path }),
   renameVideo: (videoId: number, newTitle: string) =>
     invoke("rename_video", { videoId, newTitle }),
