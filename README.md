@@ -21,7 +21,9 @@ npm run tauri dev
 ## 构建
 
 ```bash
-npm run tauri build
+# 便携版 exe（本项目约定，不产安装包）
+npm run tauri build -- --no-bundle
+# 产物：src-tauri/target/release/cine-vault.exe
 ```
 
 > 注意：本机 cargo 全局镜像为清华 tuna 且 git 全局代理 127.0.0.1:7890 常关闭。

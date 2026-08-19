@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::SystemTime;
 use tauri::State;
 
 use crate::db::DbConn;
 use crate::models::*;
 use crate::scanner;
-use crate::thumbnail;
 
 fn now_str() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -38,15 +39,12 @@ pub fn scan_folder(
     incremental: bool,
     default_watched: bool,
 ) -> Result<ScanResult, String> {
-    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-
-    // 先全量遍历构建同级信息（增量也需遍历目录才能分析目录结构）
+    // 先扫描（不持 DB 锁，避免阻塞其他查询）
     let (all_files, scan_errors) = scanner::scan_directory_reporting(&dir_path);
     let sibling_map = scanner::build_sibling_map_public(&all_files);
-
-    let existing = crate::db::get_all_file_paths(&conn).map_err(|e| e.to_string())?;
-
     let total_found = all_files.len() as i64;
+
+    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     if total_found == 0 {
         let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
         return Ok(ScanResult {
@@ -57,6 +55,10 @@ pub fn scan_folder(
             pending: Vec::new(),
         });
     }
+
+    // HashSet 加速已存在路径判定（避免全库线性查找）
+    let existing: std::collections::HashSet<String> =
+        crate::db::get_all_file_paths(&conn).map_err(|e| e.to_string())?.into_iter().collect();
 
     let mut new_added: i64 = 0;
     let mut updated: i64 = 0;
@@ -71,8 +73,7 @@ pub fn scan_folder(
         for file in &all_files {
             // 增量模式：已存在则跳过（但移动匹配需要检查路径变化 → 仍走 upsert 的移动匹配分支）
             let path_str = file.to_string_lossy().to_string();
-            let exists = if incremental { existing.contains(&path_str.to_string()) } else { false };
-            if incremental && exists {
+            if incremental && existing.contains(&path_str) {
                 continue;
             }
             let info = scanner::extract_video_info(file, &sibling_map);
@@ -150,7 +151,7 @@ pub fn add_series_from_folder(
         return Err("文件夹名不能为空".to_string());
     }
 
-    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    // 先扫描（不持 DB 锁）
     let (all_files, scan_errors) = scanner::scan_directory_reporting(&dir_path);
     let total_found = all_files.len() as i64;
     if total_found == 0 {
@@ -168,6 +169,7 @@ pub fn add_series_from_folder(
     let mut updated: i64 = 0;
     let mut errors = scan_errors;
 
+    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     {
         let tx = conn.transaction().map_err(|e| AppError::db(e.to_string()))?;
         // 文件夹名 = 剧集名（同名并入），folder_path 记录完整路径
@@ -200,13 +202,13 @@ pub fn add_series_from_folder(
                         new_added += 1;
                     } else {
                         updated += 1;
+                        // 移动匹配分支可能保留旧 series_id / 旧 user_kind，改挂本剧集（新插入无需兜底）
+                        tx.execute(
+                            "UPDATE videos SET series_id = ?1, kind = 'series', user_kind = 'series', updated_at = datetime('now','localtime') WHERE id = ?2",
+                            rusqlite::params![sid, id],
+                        )
+                        .map_err(|e| AppError::db(e.to_string()))?;
                     }
-                    // 强制归集兜底：移动匹配分支可能保留旧 series_id / 旧 user_kind，一律改挂本剧集
-                    tx.execute(
-                        "UPDATE videos SET series_id = ?1, kind = 'series', user_kind = 'series', updated_at = datetime('now','localtime') WHERE id = ?2",
-                        rusqlite::params![sid, id],
-                    )
-                    .map_err(|e| AppError::db(e.to_string()))?;
                 }
                 Err(e) => errors.push(format!("{}: {}", info.file_path, e)),
             }
@@ -225,35 +227,45 @@ pub fn add_series_from_folder(
 
 #[tauri::command]
 pub fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> Result<RefreshResult, String> {
-    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    let _ = crate::db::set_setting(&conn, "last_refresh_at", &now_str());
-    let scan_folders = crate::db::get_scan_folders(&conn).map_err(|e| e.to_string())?;
+    // 短暂持锁读取订阅列表与现有路径，随即释放（扫描期间不占锁）
+    let (scan_folders, existing) = {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        let _ = crate::db::set_setting(&conn, "last_refresh_at", &now_str());
+        let folders = crate::db::get_scan_folders(&conn).map_err(|e| e.to_string())?;
+        let paths: std::collections::HashSet<String> =
+            crate::db::get_all_file_paths(&conn).map_err(|e| e.to_string())?.into_iter().collect();
+        (folders, paths)
+    };
 
-    let existing_paths = crate::db::get_all_file_paths(&conn).map_err(|e| e.to_string())?;
-
-    let mut new_added: i64 = 0;
-    let mut moved: i64 = 0;
+    // 第一阶段：扫描所有订阅文件夹（不持锁）
+    let mut folder_jobs = Vec::new();
     let mut errors = Vec::new();
-    let mut pending: Vec<PendingItem> = Vec::new();
-    let folders_scanned = scan_folders.len() as i64;
-
-    // 第一阶段：扫描所有已订阅文件夹
     for folder in &scan_folders {
         let (all_files, scan_errors) = scanner::scan_directory_reporting(&folder.folder_path);
         for e in scan_errors {
             errors.push(format!("[{}] {}", folder.folder_path, e));
         }
         let sibling_map = scanner::build_sibling_map_public(&all_files);
+        folder_jobs.push((folder.folder_path.clone(), all_files, sibling_map));
+    }
+    let folders_scanned = scan_folders.len() as i64;
+
+    // 写库（重新持锁，锁范围只覆盖 DB 操作）
+    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    let mut new_added: i64 = 0;
+    let mut moved: i64 = 0;
+    let mut pending: Vec<PendingItem> = Vec::new();
+    for (folder_path, all_files, sibling_map) in &folder_jobs {
         {
             let tx = conn
                 .transaction()
                 .map_err(|e| AppError::db(e.to_string()))?;
-            for file in &all_files {
+            for file in all_files {
                 let path_str = file.to_string_lossy().to_string();
-                if existing_paths.contains(&path_str.to_string()) {
+                if existing.contains(&path_str) {
                     continue;
                 }
-                let info = scanner::extract_video_info(file, &sibling_map);
+                let info = scanner::extract_video_info(file, sibling_map);
                 let series_id = apply_series(&tx, &info)?;
                 match crate::db::upsert_video(
                     &tx,
@@ -294,7 +306,7 @@ pub fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> Result
             }
             tx.commit().map_err(|e| AppError::db(e.to_string()))?;
         }
-        if let Err(e) = crate::db::upsert_scan_folder(&conn, &folder.folder_path) {
+        if let Err(e) = crate::db::upsert_scan_folder(&conn, folder_path) {
             eprintln!("[refresh_all_scans] {}", e);
         }
     }
@@ -596,9 +608,12 @@ pub fn open_file(path: String) -> Result<(), String> {
 }
 
 /// 解析 PotPlayer 播放列表 dpl，把最近播放位置回填到 watch_progress
-/// 只升不降（避免覆盖已看 / 手动进度）；不碰 last_watched_at
+/// 进度只升不降（避免覆盖已看 / 手动进度）；同时刷新 last_watched_at 喂给"最近播放"排序
+/// 带 dpl 修改时间缓存：文件未变化直接返回 0（前端可无脑轮询）
 #[tauri::command]
 pub fn sync_progress_from_player(db: State<'_, DbConn>) -> Result<i64, String> {
+    static LAST_DPL_MTIME: Mutex<Option<SystemTime>> = Mutex::new(None);
+
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let dpl = Path::new(&appdata)
         .join("PotPlayerMini64")
@@ -607,7 +622,18 @@ pub fn sync_progress_from_player(db: State<'_, DbConn>) -> Result<i64, String> {
     if !dpl.exists() {
         return Ok(0);
     }
+    // mtime 未变化 → 无新进度可读
+    let mtime = std::fs::metadata(&dpl).and_then(|m| m.modified()).ok();
+    if let Ok(last) = LAST_DPL_MTIME.lock() {
+        if *last == mtime {
+            return Ok(0);
+        }
+    }
     let content = std::fs::read_to_string(&dpl).map_err(|e| e.to_string())?;
+    // 读取成功后才更新缓存（避免读取失败后一直不重试）
+    if let Ok(mut last) = LAST_DPL_MTIME.lock() {
+        *last = mtime;
+    }
 
     // 聚合列表项：N*file*path / N*start*ms / N*duration2*ms
     #[derive(Default)]
@@ -626,7 +652,10 @@ pub fn sync_progress_from_player(db: State<'_, DbConn>) -> Result<i64, String> {
             e.file = Some(p.to_string());
         } else if let Some(p) = rest.strip_prefix("start*") {
             e.start_ms = p.trim().parse().ok();
-        } else if let Some(p) = rest.strip_prefix("duration2*") {
+        } else if let Some(p) = rest
+            .strip_prefix("duration2*")
+            .or_else(|| rest.strip_prefix("duration*"))
+        {
             e.duration_ms = p.trim().parse().ok();
         }
     }
@@ -641,14 +670,32 @@ pub fn sync_progress_from_player(db: State<'_, DbConn>) -> Result<i64, String> {
             continue;
         }
         let progress = ((start as f64) / (dur as f64) * 100.0).clamp(0.0, 100.0);
+        // 进度只升不降；升了才更新进度 + 最近播放时间
         let n = conn
             .execute(
-                "UPDATE videos SET watch_progress = ?1, updated_at = datetime('now','localtime')
+                "UPDATE videos SET watch_progress = ?1, last_watched_at = datetime('now','localtime'), updated_at = datetime('now','localtime')
                  WHERE file_path = ?2 COLLATE NOCASE AND watch_progress < ?1",
                 rusqlite::params![progress, path],
             )
             .map_err(|e| e.to_string())?;
         updated += n as i64;
+        // 进度未升（如重看开头）也刷新最近播放时间，保证"最近播放"排序有新数据
+        conn.execute(
+            "UPDATE videos SET last_watched_at = datetime('now','localtime')
+             WHERE file_path = ?1 COLLATE NOCASE AND watch_progress >= ?2",
+            rusqlite::params![path, progress],
+        )
+        .map_err(|e| e.to_string())?;
+        // 同步其所属剧集的聚合字段（剧集卡片排序/进度条数据源）
+        conn.execute(
+            "UPDATE series SET
+                last_watched_at = (SELECT MAX(v.last_watched_at) FROM videos v WHERE v.series_id = series.id),
+                watch_progress = (SELECT COALESCE(MAX(v.watch_progress), 0) FROM videos v WHERE v.series_id = series.id),
+                updated_at = datetime('now','localtime')
+             WHERE id IN (SELECT DISTINCT series_id FROM videos WHERE file_path = ?1 COLLATE NOCASE AND series_id IS NOT NULL)",
+            rusqlite::params![path],
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(updated)
 }
@@ -701,16 +748,17 @@ pub fn delete_video_with_file(db: State<'_, DbConn>, video_id: i64) -> Result<St
             |r| r.get(0),
         )
         .map_err(|_| AppError::db("视频不存在"))?;
-    crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+    // 先删文件再删记录：文件删除失败时保留记录，评分/标签/进度不丢
     match std::fs::remove_file(&file_path) {
-        Ok(()) => Ok(format!("已删除文件: {}", file_path)),
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Ok(format!("记录已删除，文件不存在: {}", file_path))
-            } else {
-                Err(format!("记录已删除，但文件删除失败: {}", e))
-            }
+        Ok(()) => {
+            crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+            Ok(format!("已删除文件: {}", file_path))
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+            Ok(format!("记录已删除，文件不存在: {}", file_path))
+        }
+        Err(e) => Err(format!("文件删除失败，记录已保留: {}", e)),
     }
 }
 
@@ -754,9 +802,7 @@ pub fn delete_scan_folder(db: State<'_, DbConn>, folder_id: i64) -> Result<(), S
 // ============================================
 /// 探测旧库：返回旧库路径（存在即返回——已迁移过也可重复同步，迁移幂等）
 #[tauri::command]
-pub fn check_migration(db: State<'_, DbConn>) -> Result<Option<String>, String> {
-    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    let _ = crate::migrator::already_migrated(&conn).map_err(|e| e.to_string())?;
+pub fn check_migration() -> Result<Option<String>, String> {
     Ok(crate::migrator::locate_old_db())
 }
 
@@ -791,19 +837,33 @@ pub fn import_json(db: State<'_, DbConn>, json_str: String) -> Result<ImportResu
     crate::db::import_data(&conn, &data).map_err(|e| e.to_string())
 }
 
-/// 读取文本文件（配合导入：前端选文件后读取内容）
+/// 读取文本文件（配合导入：前端选文件后读取内容；仅限 .json 备份）
 #[tauri::command]
 pub fn read_text_file(file_path: String) -> Result<String, String> {
+    const MAX_JSON_SIZE: u64 = 50_000_000;
     let p = Path::new(&file_path);
     if !p.exists() || !p.is_file() {
         return Err(format!("文件不存在: {}", file_path));
     }
+    if !file_path.to_lowercase().ends_with(".json") {
+        return Err("仅支持读取 .json 文件".to_string());
+    }
+    if p.metadata().map(|m| m.len()).unwrap_or(0) > MAX_JSON_SIZE {
+        return Err("文件过大（超过 50MB）".to_string());
+    }
     std::fs::read_to_string(&file_path).map_err(|e| format!("读取文件失败: {}", e))
 }
 
-/// 写文本文件（配合导出：前端选保存位置后写入 JSON）
+/// 写文本文件（配合导出：前端选保存位置后写入 JSON；仅限 .json）
 #[tauri::command]
 pub fn write_text_file(file_path: String, content: String) -> Result<(), String> {
+    const MAX_JSON_SIZE: usize = 50_000_000;
+    if !file_path.to_lowercase().ends_with(".json") {
+        return Err("仅支持写入 .json 文件".to_string());
+    }
+    if content.len() > MAX_JSON_SIZE {
+        return Err("内容过大（超过 50MB）".to_string());
+    }
     let p = Path::new(&file_path);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {
@@ -811,23 +871,6 @@ pub fn write_text_file(file_path: String, content: String) -> Result<(), String>
         }
     }
     std::fs::write(&file_path, content).map_err(|e| format!("写入文件失败: {}", e))
-}
-
-// ============================================
-// 缩略图（截帧兜底，暂不接入 UI）
-// ============================================
-#[tauri::command]
-pub fn make_thumbnail(db: State<'_, DbConn>, video_id: i64, video_path: String, thumb_dir: String) -> Result<Option<String>, String> {
-    let result = thumbnail::generate_thumbnail(&video_path, &thumb_dir);
-    if let Some(ref path) = result {
-        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-        conn.execute(
-            "UPDATE videos SET thumbnail_path = ?1 WHERE id = ?2",
-            rusqlite::params![path, video_id],
-        )
-        .map_err(|e| AppError::db(e.to_string()))?;
-    }
-    Ok(result)
 }
 
 // ============================================

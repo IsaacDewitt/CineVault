@@ -79,6 +79,7 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             watched_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             progress REAL NOT NULL DEFAULT 0
          );
+         CREATE INDEX IF NOT EXISTS idx_watch_history_video ON watch_history(video_id);
          CREATE TABLE IF NOT EXISTS scan_folders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             folder_path TEXT NOT NULL UNIQUE,
@@ -109,12 +110,6 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), AppE
         params![key, value],
     )?;
     Ok(())
-}
-
-pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, AppError> {
-    Ok(conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
-        .optional()?)
 }
 
 // ============================================
@@ -158,6 +153,7 @@ fn row_to_series_overview(row: &Row) -> rusqlite::Result<SeriesOverview> {
         rating: row.get(7)?,
         is_favorite: row.get::<_, i32>(8)? != 0,
         last_watched_at: row.get(9)?,
+        updated_at: row.get(10)?,
         tags: Vec::new(),
     })
 }
@@ -167,7 +163,7 @@ const SERIES_OVERVIEW_COLS: &str = "se.id, se.name, se.folder_path,
     (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id AND EXISTS (SELECT 1 FROM watch_history h WHERE h.video_id = v.id)) AS watched_episodes,
     (SELECT COALESCE(MAX(v.watch_progress), 0) FROM videos v WHERE v.series_id = se.id) AS progress,
     (SELECT COALESCE(SUM(v.file_size), 0) FROM videos v WHERE v.series_id = se.id) AS total_size,
-    se.rating, se.is_favorite, se.last_watched_at";
+    se.rating, se.is_favorite, se.last_watched_at, se.updated_at";
 
 // ============================================
 // 视频 CRUD（含移动匹配迁移）
@@ -370,87 +366,6 @@ pub fn query_videos_paginated(
     Ok(PaginatedVideos { items, total, page, page_size, has_more: (page + 1) * page_size < total })
 }
 
-pub fn get_all_videos(conn: &Connection, page: i64, page_size: i64) -> Result<PaginatedVideos, AppError> {
-    query_videos_paginated(conn, &[], &[], page, page_size, 0.0, "last_watched")
-}
-
-pub fn search_videos(
-    conn: &Connection,
-    query: &str,
-    kind: Option<&str>,
-    page: i64,
-    page_size: i64,
-    min_rating: f64,
-    sort: &str,
-) -> Result<PaginatedVideos, AppError> {
-    let mut conditions = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    if !query.trim().is_empty() {
-        let q = format!("%{}%", escape_like(query.trim()));
-        conditions.push("(v.title LIKE ?1 ESCAPE '\\' OR v.file_name LIKE ?1 ESCAPE '\\')".to_string());
-        params.push(Box::new(q));
-    }
-    if let Some(k) = kind {
-        if !k.is_empty() && k != "all" {
-            let idx = params.len() + 1;
-            conditions.push(format!("v.kind = ?{}", idx));
-            params.push(Box::new(k.to_string()));
-        }
-    }
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    query_videos_paginated(conn, &conditions, &param_refs, page, page_size, min_rating, sort)
-}
-
-pub fn get_videos_by_tags(
-    conn: &Connection,
-    tag_ids: &[i64],
-    kind: Option<&str>,
-    favorites_only: bool,
-    page: i64,
-    page_size: i64,
-    min_rating: f64,
-    sort: &str,
-) -> Result<PaginatedVideos, AppError> {
-    let mut conditions = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    for (i, _tid) in tag_ids.iter().enumerate() {
-        let idx = i + 1;
-        conditions.push(format!(
-            "EXISTS (SELECT 1 FROM video_tags vt_{0} WHERE vt_{0}.video_id = v.id AND vt_{0}.tag_id = ?{0})",
-            idx
-        ));
-        params.push(Box::new(tag_ids[i]));
-    }
-    if let Some(k) = kind {
-        if !k.is_empty() && k != "all" {
-            let idx = params.len() + 1;
-            conditions.push(format!("v.kind = ?{}", idx));
-            params.push(Box::new(k.to_string()));
-        }
-    }
-    if favorites_only {
-        conditions.push("v.is_favorite = 1".to_string());
-    }
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    query_videos_paginated(conn, &conditions, &param_refs, page, page_size, min_rating, sort)
-}
-
-pub fn get_favorite_videos(
-    conn: &Connection,
-    page: i64,
-    page_size: i64,
-    min_rating: f64,
-    sort: &str,
-) -> Result<PaginatedVideos, AppError> {
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    let mut conditions = vec!["v.is_favorite = 1".to_string()];
-    if min_rating > 0.0 {
-        conditions.push(format!("v.rating >= {}", min_rating));
-    }
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    query_videos_paginated(conn, &conditions, &param_refs, page, page_size, min_rating, sort)
-}
-
 pub fn get_recently_added_videos(
     conn: &Connection,
     page: i64,
@@ -591,6 +506,13 @@ pub fn update_watch_progress(conn: &Connection, video_id: i64, progress: f64) ->
         "INSERT INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
         params![video_id, now, progress],
     )?;
+    // 每个视频最多保留最近 50 条历史，防 DB 无限膨胀（idx_watch_history_video 加速）
+    conn.execute(
+        "DELETE FROM watch_history WHERE id IN (
+            SELECT id FROM watch_history WHERE video_id = ?1 ORDER BY id DESC LIMIT -1 OFFSET 50
+        )",
+        params![video_id],
+    )?;
     // 剧集进度同步到实体
     if let Some(sid) = conn
         .query_row("SELECT series_id FROM videos WHERE id = ?1", params![video_id], |r| r.get::<_, Option<i64>>(0))
@@ -722,6 +644,25 @@ pub fn get_pending_videos(conn: &Connection) -> Result<Vec<PendingItem>, AppErro
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// 无剧集名时用父文件夹名兜底；都没有才建"未命名剧集"（避免留下空壳）
+fn series_name_from_folder(tx: &rusqlite::Transaction, video_id: i64) -> Result<i64, AppError> {
+    let path: String = tx.query_row(
+        "SELECT file_path FROM videos WHERE id = ?1",
+        params![video_id],
+        |r| r.get(0),
+    )?;
+    if let Some(n) = std::path::Path::new(&path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        return upsert_series(tx, n, None);
+    }
+    upsert_series(tx, "未命名剧集", None)
+}
+
 /// 用户裁决待确认项：kind = movie/series，series_name 可选（仅 series）
 pub fn resolve_pending(
     conn: &Connection,
@@ -735,39 +676,9 @@ pub fn resolve_pending(
         params![kind, video_id],
     )?;
     if kind == "series" {
-        let fallback = upsert_series(&tx, "未命名剧集", None)?;
-        let sid = if let Some(name) = series_name {
-            let name = name.trim();
-            if name.is_empty() {
-                // 无剧集名 → 用父文件夹名
-                let path: String = tx.query_row(
-                    "SELECT file_path FROM videos WHERE id = ?1",
-                    params![video_id],
-                    |r| r.get(0),
-                )?;
-                std::path::Path::new(&path)
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|n| upsert_series(&tx, n, None))
-                    .transpose()?
-                    .unwrap_or(fallback)
-            } else {
-                upsert_series(&tx, name, None)?
-            }
-        } else {
-            let path: String = tx.query_row(
-                "SELECT file_path FROM videos WHERE id = ?1",
-                params![video_id],
-                |r| r.get(0),
-            )?;
-            std::path::Path::new(&path)
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(|n| upsert_series(&tx, n, None))
-                .transpose()?
-                .unwrap_or(fallback)
+        let sid = match series_name.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => upsert_series(&tx, name, None)?,
+            None => series_name_from_folder(&tx, video_id)?,
         };
         tx.execute(
             "UPDATE videos SET series_id = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
@@ -883,8 +794,7 @@ pub fn delete_scan_folder(conn: &Connection, folder_id: i64) -> Result<(), AppEr
 // ============================================
 pub fn export_data(conn: &Connection) -> Result<ExportData, AppError> {
     // 全量视频 + 标签
-    let mut videos: Vec<VideoWithTags> = Vec::new();
-    {
+    let videos: Vec<VideoWithTags> = {
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM videos v LEFT JOIN series s ON s.id = v.series_id ORDER BY v.id",
             VIDEO_COLS
@@ -898,15 +808,13 @@ pub fn export_data(conn: &Connection) -> Result<ExportData, AppError> {
             raw.push(v);
         }
         let tag_map = load_tags_for(conn, &ids)?;
-        let videos_with_tags: Vec<VideoWithTags> = raw
-            .into_iter()
+        raw.into_iter()
             .map(|video| VideoWithTags {
                 tags: tag_map.get(&video.id).cloned().unwrap_or_default(),
                 video,
             })
-            .collect();
-        videos = videos_with_tags;
-    }
+            .collect()
+    };
 
     let series = get_series_overview(conn)?;
     let tags = get_all_tags(conn)?;

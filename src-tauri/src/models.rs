@@ -91,20 +91,6 @@ pub struct Tag {
     pub video_count: Option<i64>,
 }
 
-/// 剧集实体（name 唯一键）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Series {
-    pub id: i64,
-    pub name: String,
-    pub folder_path: Option<String>,
-    pub rating: f64,
-    pub is_favorite: bool,
-    pub last_watched_at: Option<String>,
-    pub watch_progress: f64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 /// 剧集概览（剧集列表页）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesOverview {
@@ -118,6 +104,9 @@ pub struct SeriesOverview {
     pub rating: f64,
     pub is_favorite: bool,
     pub last_watched_at: Option<String>,
+    /// 旧备份 JSON 无此字段，缺省空串以兼容导入
+    #[serde(default)]
+    pub updated_at: String,
     pub tags: Vec<Tag>,
 }
 

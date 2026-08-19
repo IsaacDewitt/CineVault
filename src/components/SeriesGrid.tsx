@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import type { SeriesOverview, Tag } from "../types";
+import type { SeriesOverview, SortKey, Tag } from "../types";
 import { api } from "../api";
 import {
   ConfirmDialog,
@@ -15,11 +15,13 @@ import {
 
 export function SeriesGrid({
   series,
+  sort,
   onOpen,
   tags,
   onChanged,
 }: {
   series: SeriesOverview[];
+  sort: SortKey;
   onOpen: (s: SeriesOverview) => void;
   tags: Tag[];
   onChanged: () => void;
@@ -86,10 +88,28 @@ export function SeriesGrid({
     { label: "🗑 删除剧集（记录）", danger: true, onClick: () => setConfirmDel(s) },
   ];
 
+  // 顶栏排序：剧集全量在内存排序（updated_at 为 SQLite "YYYY-MM-DD HH:MM:SS"，字符串比较即时间序）
+  const sorted = [...series].sort((a, b) => {
+    switch (sort) {
+      case "updated":
+        return b.updated_at.localeCompare(a.updated_at);
+      case "last_watched":
+        return (b.last_watched_at ?? "").localeCompare(a.last_watched_at ?? "");
+      case "name":
+        return a.name.localeCompare(b.name, "zh-Hans-CN");
+      case "size":
+        return b.total_size - a.total_size;
+      case "rating":
+        return b.rating - a.rating;
+      default:
+        return 0;
+    }
+  });
+
   return (
     <div>
       <div className="series-grid">
-        {series.map((s) => {
+        {sorted.map((s) => {
           const pct = progressPct(s.progress);
           return (
             <div

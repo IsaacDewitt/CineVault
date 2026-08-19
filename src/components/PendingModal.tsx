@@ -12,6 +12,9 @@ export function PendingModal({
 }) {
   const [items, setItems] = useState<PendingItem[]>([]);
   const [busy, setBusy] = useState(false);
+  // 剧集命名弹窗（WebView2 不支持 window.prompt，必须用自定义输入框）
+  const [naming, setNaming] = useState<PendingItem | null>(null);
+  const [seriesName, setSeriesName] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -25,15 +28,10 @@ export function PendingModal({
     load();
   }, [load]);
 
-  const decide = async (item: PendingItem, kind: "movie" | "series") => {
+  const submit = async (item: PendingItem, kind: "movie" | "series", name: string | null) => {
     setBusy(true);
     try {
-      if (kind === "series") {
-        const name = prompt("剧集名（留空则用所在文件夹名）:", item.title) ?? "";
-        await api.resolvePending(item.video_id, "series", name.trim() || null);
-      } else {
-        await api.resolvePending(item.video_id, "movie", null);
-      }
+      await api.resolvePending(item.video_id, kind, name);
       toast.ok(kind === "series" ? "已归入剧集" : "已归为电影");
       await load();
       onChanged();
@@ -42,6 +40,13 @@ export function PendingModal({
     } finally {
       setBusy(false);
     }
+  };
+
+  const confirmSeriesName = async () => {
+    if (!naming) return;
+    const item = naming;
+    setNaming(null);
+    await submit(item, "series", seriesName.trim() || null);
   };
 
   return (
@@ -75,7 +80,7 @@ export function PendingModal({
               className="btn btn-ghost"
               style={{ fontSize: 11.5, padding: "4px 10px" }}
               disabled={busy}
-              onClick={() => decide(it, "movie")}
+              onClick={() => submit(it, "movie", null)}
             >
               是电影
             </button>
@@ -83,12 +88,44 @@ export function PendingModal({
               className="btn btn-primary"
               style={{ fontSize: 11.5, padding: "4px 10px" }}
               disabled={busy}
-              onClick={() => decide(it, "series")}
+              onClick={() => {
+                setNaming(it);
+                setSeriesName(it.title);
+              }}
             >
               是剧集
             </button>
           </div>
         ))
+      )}
+
+      {naming && (
+        <Modal
+          title={`归入剧集 · ${naming.title}`}
+          onClose={() => setNaming(null)}
+          footer={
+            <>
+              <button className="btn btn-ghost" onClick={() => setNaming(null)}>
+                取消
+              </button>
+              <button className="btn btn-primary" onClick={confirmSeriesName} disabled={busy}>
+                确认
+              </button>
+            </>
+          }
+        >
+          <p style={{ fontSize: 12.5, color: "var(--text-3)", marginBottom: 10, lineHeight: 1.7 }}>
+            输入剧集名；留空则使用所在文件夹名。
+          </p>
+          <input
+            className="input"
+            autoFocus
+            placeholder="剧集名"
+            value={seriesName}
+            onChange={(e) => setSeriesName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && confirmSeriesName()}
+          />
+        </Modal>
       )}
     </Modal>
   );

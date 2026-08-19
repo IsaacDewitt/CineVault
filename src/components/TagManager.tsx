@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useState } from "react";
 import type { Tag } from "../types";
 import { api } from "../api";
-import { Modal, toast } from "./ui";
+import { ConfirmDialog, Modal, toast } from "./ui";
 
 export function TagManager({ onClose, onChanged }: { onClose: () => void; onChanged: () => void }) {
   const [tags, setTags] = useState<Tag[]>([]);
   const [name, setName] = useState("");
   const [color, setColor] = useState("#e8b34b");
+  const [confirmDel, setConfirmDel] = useState<Tag | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -105,15 +106,7 @@ export function TagManager({ onClose, onChanged }: { onClose: () => void; onChan
             <button
               className="icon-btn"
               style={{ width: 24, height: 24, fontSize: 13 }}
-              onClick={async () => {
-                try {
-                  await api.deleteTag(t.id);
-                  await load();
-                  onChanged();
-                } catch (err) {
-                  toast.err(String(err));
-                }
-              }}
+              onClick={() => setConfirmDel(t)}
             >
               🗑
             </button>
@@ -125,6 +118,27 @@ export function TagManager({ onClose, onChanged }: { onClose: () => void; onChan
           </div>
         )}
       </div>
+
+      {confirmDel && (
+        <ConfirmDialog
+          title="删除标签"
+          message={`确定删除标签「${confirmDel.name}」？\n\n所有视频/剧集上的该标签将被一并移除。`}
+          danger
+          confirmText="删除"
+          onConfirm={async () => {
+            const t = confirmDel;
+            setConfirmDel(null);
+            try {
+              await api.deleteTag(t.id);
+              await load();
+              onChanged();
+            } catch (err) {
+              toast.err(String(err));
+            }
+          }}
+          onCancel={() => setConfirmDel(null)}
+        />
+      )}
     </Modal>
   );
 }

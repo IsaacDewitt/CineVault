@@ -33,6 +33,8 @@ export function VideoList({
   const watched = (v: VideoWithTags) => v.watch_progress >= 99.9;
 
   const setProgress = async (v: VideoWithTags, p: number) => {
+    // 先本地预览，再持久化（拖动滑条即保存，与详情弹窗行为一致）
+    setProgressVideo((prev) => (prev ? { ...prev, watch_progress: p } : prev));
     try {
       await api.updateProgress(v.id, p);
       toast.ok(`进度已设为 ${Math.round(p)}%`);
@@ -212,10 +214,7 @@ export function VideoList({
               max={100}
               step={5}
               value={Math.round(progressVideo.watch_progress)}
-              onChange={(e) => {
-                const p = Number(e.target.value);
-                setProgressVideo({ ...progressVideo, watch_progress: p });
-              }}
+              onChange={(e) => setProgress(progressVideo, Number(e.target.value))}
             />
             <span className="rating-num" style={{ minWidth: 42 }}>
               {Math.round(progressVideo.watch_progress)}%

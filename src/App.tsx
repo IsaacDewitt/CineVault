@@ -188,6 +188,34 @@ export default function App() {
     }
   }, []);
 
+  // 切回窗口（从 PotPlayer 等外部应用返回）→ 自动同步进度并按当前视图刷新
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      syncPlayerProgress().then(() => {
+        if (view === "series") {
+          fetchSeries();
+        } else if (view === "history") {
+          fetchHistory();
+        } else if (view === "recent") {
+          api
+            .getRecentlyAdded(0, PAGE_SIZE)
+            .then((res) => {
+              setVideos(res.items);
+              setTotal(res.total);
+              setHasMore(res.has_more);
+              setPage(0);
+            })
+            .catch(() => {});
+        } else {
+          fetchVideos(0);
+        }
+      });
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [syncPlayerProgress, fetchVideos, fetchSeries, fetchHistory, view]);
+
   const refreshAll = useCallback(async () => {
     try {
       const r = await api.refreshAllScans(false);
@@ -215,6 +243,10 @@ export default function App() {
   // ===== 播放 =====
   // 交给系统默认播放器（PotPlayer），续播由 PotPlayer 内置记忆位置负责
   const play = async (v: VideoWithTags) => {
+    if (!v.file_path) {
+      toast.err("该记录无文件路径（可能已删除），无法播放");
+      return;
+    }
     try {
       await api.openFile(v.file_path);
     } catch (e) {
@@ -362,7 +394,7 @@ export default function App() {
               <div className="view-title">
                 {viewTitle[view]}
                 <span className="hint">
-                  {view === "all" || view === "movies" || view === "favorites" || view === "recent"
+                  {view === "all" || view === "movies" || view === "favorites" || (view === "recent" && !q)
                     ? `${total} 条`
                     : ""}
                 </span>
@@ -371,6 +403,7 @@ export default function App() {
               {view === "series" ? (
                 <SeriesGrid
                   series={series.filter(matchS)}
+                  sort={sort}
                   onOpen={(s) => {
                     setCurrentSeries(s);
                     setSelectedTagIds([]);
@@ -393,7 +426,8 @@ export default function App() {
                     onPlay={play}
                     onChanged={afterDataChange}
                   />
-                  {hasMore && (
+                  {/* 前端过滤时禁用"加载更多"（分页数据未过滤，避免错乱） */}
+                  {hasMore && !q && (
                     <div className="load-more">
                       <button className="btn btn-ghost" onClick={() => fetchVideos(page + 1, true)}>
                         {loading ? "加载中…" : "加载更多"}

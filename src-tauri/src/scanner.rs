@@ -33,32 +33,6 @@ pub fn scan_directory_reporting(path: &str) -> (Vec<PathBuf>, Vec<String>) {
     (files, errors)
 }
 
-/// 增量扫描（带错误收集）：只返回数据库中不存在的文件
-pub fn scan_directory_incremental_reporting(
-    path: &str,
-    existing_paths: &[String],
-) -> (Vec<PathBuf>, Vec<String>) {
-    let existing: std::collections::HashSet<&str> =
-        existing_paths.iter().map(|s| s.as_str()).collect();
-    let mut files = Vec::new();
-    let mut errors = Vec::new();
-    for entry in WalkDir::new(path).into_iter() {
-        match entry {
-            Ok(e) => {
-                if !e.file_type().is_file() || !is_video_file(e.path()) {
-                    continue;
-                }
-                let path_str = e.path().to_string_lossy();
-                if !existing.contains(path_str.as_ref()) {
-                    files.push(e.path().to_path_buf());
-                }
-            }
-            Err(e) => errors.push(e.to_string()),
-        }
-    }
-    (files, errors)
-}
-
 pub struct VideoInfo {
     pub title: String,
     pub file_path: String,

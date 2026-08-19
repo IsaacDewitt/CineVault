@@ -7,7 +7,6 @@ mod db;
 mod migrator;
 mod models;
 mod scanner;
-mod thumbnail;
 
 use rusqlite::Connection;
 use std::fs;
@@ -151,7 +150,6 @@ fn main() {
             commands::import_json,
             commands::read_text_file,
             commands::write_text_file,
-            commands::make_thumbnail,
             commands::get_drives,
         ])
         .run(tauri::generate_context!())

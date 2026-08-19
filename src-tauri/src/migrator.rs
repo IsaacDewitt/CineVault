@@ -22,11 +22,6 @@ pub fn locate_old_db() -> Option<String> {
     }
 }
 
-/// 检查是否已迁移
-pub fn already_migrated(conn: &Connection) -> Result<bool, AppError> {
-    Ok(crate::db::get_setting(conn, "migrated_from")?.is_some())
-}
-
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -156,7 +151,7 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
                 let old_series_id: Option<i64> = if has_series_id { let v = r.get(idx)?; idx += 1; v } else { None };
                 let old_series_name: Option<String> = if has_series_name { let v = r.get(idx)?; idx += 1; v } else { None };
                 let old_kind: Option<String> = if has_kind { let v = r.get(idx)?; idx += 1; v } else { None };
-                let old_user_kind: Option<String> = if has_user_kind { let v = r.get(idx)?; idx += 1; v } else { None };
+                let old_user_kind: Option<String> = if has_user_kind { r.get(idx)? } else { None };
                 Ok((id, title, file_path, file_name, file_size, duration, rating, is_favorite, video_type, season, episode, last_watched_at, watch_progress, updated_at, old_series_id, old_series_name, old_kind, old_user_kind))
             })
             .map_err(|e| AppError::db(e.to_string()))?;

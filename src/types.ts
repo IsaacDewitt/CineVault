@@ -26,26 +26,7 @@ export interface Video {
   updated_at: string;
 }
 
-export interface VideoWithTags {
-  id: number;
-  title: string;
-  file_path: string;
-  file_name: string;
-  file_size: number;
-  duration: number | null;
-  rating: number;
-  is_favorite: boolean;
-  kind: VideoKind;
-  confidence: number;
-  user_kind: string | null;
-  series_id: number | null;
-  series_name: string | null;
-  season: number | null;
-  episode: number | null;
-  last_watched_at: string | null;
-  watch_progress: number;
-  created_at: string;
-  updated_at: string;
+export interface VideoWithTags extends Video {
   tags: Tag[];
 }
 
@@ -67,6 +48,7 @@ export interface SeriesOverview {
   rating: number;
   is_favorite: boolean;
   last_watched_at: string | null;
+  updated_at: string;
   tags: Tag[];
 }
 
