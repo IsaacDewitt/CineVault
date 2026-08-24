@@ -13,10 +13,17 @@ fn now_str() -> String {
 }
 
 /// 分类结果 → 系列归属处理
+/// 0. 路径锚点认领：文件落在某已注册剧集（series.folder_path）目录树内 → 直接归该剧集，
+///    不再走分类器（避免「添加剧集」建的剧集被刷新扫描拆散 / 新集被分类成别名剧集）
+/// 1. 分类器产出的剧集名 upsert（原名逻辑）
 fn apply_series(
     tx: &rusqlite::Transaction,
     info: &scanner::VideoInfo,
+    folder_anchors: &[(i64, String)],
 ) -> Result<Option<i64>, AppError> {
+    if let Some(sid) = match_folder_anchor(&info.file_path, folder_anchors) {
+        return Ok(Some(sid));
+    }
     if info.kind == "series" {
         if let Some(ref name) = info.series_name {
             let name = name.trim();
@@ -27,6 +34,44 @@ fn apply_series(
         }
     }
     Ok(None)
+}
+
+/// 最长前缀匹配：file_path 是否落在某 series.folder_path 目录树内（大小写不敏感，按目录边界）
+fn match_folder_anchor(file_path: &str, anchors: &[(i64, String)]) -> Option<i64> {
+    let norm = |p: &str| p.trim_end_matches(|c| c == '/' || c == '\\').to_lowercase();
+    let fp = norm(file_path);
+    let mut best: Option<(usize, i64)> = None;
+    for (sid, folder) in anchors {
+        let f = norm(folder);
+        if f.is_empty() || fp.len() < f.len() || fp[..f.len()] != f {
+            continue;
+        }
+        // 必须落在目录边界（folder 是文件本身所在目录的祖先），避免 H:\剧 误配 H:\剧集
+        let boundary_ok = fp.len() == f.len()
+            || fp[f.len()..]
+                .chars()
+                .next()
+                .map_or(false, |c| c == '\\' || c == '/');
+        if boundary_ok && best.as_ref().map_or(true, |(blen, _)| f.len() > *blen) {
+            best = Some((f.len(), *sid));
+        }
+    }
+    best.map(|(_, sid)| sid)
+}
+
+/// 读取所有已注册剧集目录锚点（folder_path 非空）
+fn load_folder_anchors(conn: &rusqlite::Connection) -> Result<Vec<(i64, String)>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, folder_path FROM series WHERE folder_path IS NOT NULL AND folder_path != ''",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut v = Vec::new();
+    for r in rows {
+        if let Ok(x) = r {
+            v.push(x);
+        }
+    }
+    Ok(v)
 }
 
 // ============================================
@@ -45,6 +90,8 @@ pub fn scan_folder(
     let total_found = all_files.len() as i64;
 
     let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    // 已注册剧集目录锚点（路径认领用）
+    let folder_anchors = load_folder_anchors(&conn)?;
     if total_found == 0 {
         let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
         return Ok(ScanResult {
@@ -77,7 +124,7 @@ pub fn scan_folder(
                 continue;
             }
             let info = scanner::extract_video_info(file, &sibling_map);
-            let series_id = apply_series(&tx, &info)?;
+            let series_id = apply_series(&tx, &info, &folder_anchors)?;
             match crate::db::upsert_video(
                 &tx,
                 &VideoUpsertParams {
@@ -252,6 +299,8 @@ pub fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> Result
 
     // 写库（重新持锁，锁范围只覆盖 DB 操作）
     let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    // 已注册剧集目录锚点（路径认领用）
+    let folder_anchors = load_folder_anchors(&conn)?;
     let mut new_added: i64 = 0;
     let mut moved: i64 = 0;
     let mut pending: Vec<PendingItem> = Vec::new();
@@ -266,7 +315,7 @@ pub fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> Result
                     continue;
                 }
                 let info = scanner::extract_video_info(file, sibling_map);
-                let series_id = apply_series(&tx, &info)?;
+                let series_id = apply_series(&tx, &info, &folder_anchors)?;
                 match crate::db::upsert_video(
                     &tx,
                     &VideoUpsertParams {
@@ -897,4 +946,68 @@ pub fn get_drives() -> Result<Vec<DriveInfo>, String> {
         }
     }
     Ok(drives)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::match_folder_anchor;
+
+    fn anchors() -> Vec<(i64, String)> {
+        vec![
+            (1, "H:\\待看的剧".to_string()),
+            (2, "H:\\待看的剧\\绿灯侠".to_string()),
+            (3, "E:\\动漫风车".to_string()),
+        ]
+    }
+
+    #[test]
+    fn anchor_hits_subfolder() {
+        // 绿灯侠 folder_path 最长前缀优先，命中 2 而非 1
+        let a = anchors();
+        assert_eq!(
+            match_folder_anchor(
+                "H:\\待看的剧\\绿灯侠\\Lanterns.2026.S01E02.1080p.官方中英.mp4",
+                &a
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn anchor_hits_loose_prefix() {
+        let a = anchors();
+        // 直接在父目录下的文件 → 归父目录剧集
+        assert_eq!(
+            match_folder_anchor("H:\\待看的剧\\SomeShow.S01E01.mkv", &a),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn anchor_respects_dir_boundary() {
+        // H:\待看的剧集 不是 H:\待看的剧 的子目录，不得误配
+        let a = anchors();
+        assert_eq!(
+            match_folder_anchor("H:\\待看的剧集\\X.S01E01.mkv", &a),
+            None
+        );
+    }
+
+    #[test]
+    fn anchor_is_case_insensitive() {
+        let a = anchors();
+        assert_eq!(
+            match_folder_anchor("h:\\待看的剧\\绿灯侠\\ep02.mp4", &a),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn anchor_no_match() {
+        let a = anchors();
+        assert_eq!(
+            match_folder_anchor("Z:\\电影\\Batman.2022.mkv", &a),
+            None
+        );
+    }
 }

@@ -267,8 +267,10 @@ pub fn clean_series_name(title: &str) -> String {
         "repack", "chinese", "中文字幕", "国语", "粤语",
     ];
     let mut name = title.to_string();
-    name = SEASON_EPISODE_RE.replace_all(&name, "").to_string();
-    name = EPISODE_RE.replace_all(&name, "").to_string();
+    // 季/集标记替换为空格而非空串：直接删会把分隔符一起吃掉（Lanterns.2026.S01E02.1080p
+    // → Lanterns.20261080p），导致年份/分辨率粘连、YEAR_RE 词边界失效、年份残留进剧集名
+    name = SEASON_EPISODE_RE.replace_all(&name, " ").to_string();
+    name = EPISODE_RE.replace_all(&name, " ").to_string();
     name = YEAR_RE.replace_all(&name, "").to_string();
     let mut changed = true;
     while changed {
