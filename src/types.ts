@@ -110,15 +110,6 @@ export interface ScanFolder {
   last_scanned_at: string | null;
 }
 
-export interface MigrationResult {
-  videos: number;
-  series: number;
-  tags: number;
-  history: number;
-  scan_folders: number;
-  from_path: string;
-}
-
 export type ViewKey =
   | "all"
   | "movies"

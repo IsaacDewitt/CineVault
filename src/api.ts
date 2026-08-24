@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ExportData,
   ImportResult,
-  MigrationResult,
   PaginatedVideos,
   PendingItem,
   RefreshResult,
@@ -112,11 +111,6 @@ export const api = {
   getScanFolders: () => invoke<ScanFolder[]>("get_scan_folders"),
   deleteScanFolder: (folderId: number) =>
     invoke("delete_scan_folder", { folderId }),
-
-  // 迁移
-  checkMigration: () => invoke<string | null>("check_migration"),
-  migrateFromOld: (oldPath: string | null) =>
-    invoke<MigrationResult>("migrate_from_old", { oldPath }),
 
   // 导出 / 导入
   exportJson: () => invoke<ExportData>("export_json"),

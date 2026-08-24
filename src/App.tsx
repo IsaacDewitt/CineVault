@@ -21,7 +21,7 @@ import { ScanModal } from "./components/ScanModal";
 import { AddSeriesModal } from "./components/AddSeriesModal";
 import { PendingModal } from "./components/PendingModal";
 import { TagManager } from "./components/TagManager";
-import { MigrateBanner } from "./components/MigrateBanner";
+
 import { ToastHost, toast, formatSize } from "./components/ui";
 
 const PAGE_SIZE = 80;
@@ -47,7 +47,6 @@ export default function App() {
   const [tags, setTags] = useState<Tag[]>([]);
   const [stats, setStats] = useState<VideoStats | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
-  const [migrationPath, setMigrationPath] = useState<string | null>(null);
 
   // 当前剧集详情
   const [currentSeries, setCurrentSeries] = useState<SeriesOverview | null>(null);
@@ -131,21 +130,12 @@ export default function App() {
     }
   }, []);
 
-  const checkMigration = useCallback(async () => {
-    try {
-      setMigrationPath(await api.checkMigration());
-    } catch (e) {
-      /* 忽略 */
-    }
-  }, []);
-
   // 初始化
   useEffect(() => {
-    checkMigration();
     fetchTags();
     fetchStats();
     fetchPendingCount();
-  }, [checkMigration, fetchTags, fetchStats, fetchPendingCount]);
+  }, [fetchTags, fetchStats, fetchPendingCount]);
 
   // 搜索框只需更新 query；防抖由下方 useEffect 处理（避免 setTimeout 闭包陷阱）
   const onQueryChange = (q: string) => setQuery(q);
@@ -376,10 +366,6 @@ export default function App() {
         </div>
 
         <div className="content">
-          {migrationPath && (
-            <MigrateBanner oldPath={migrationPath} onDone={() => { setMigrationPath(null); afterDataChange(); }} />
-          )}
-
           {currentSeries ? (
             <SeriesDetailView
               series={currentSeries}

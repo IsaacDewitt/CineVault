@@ -300,6 +300,7 @@ select:focus-visible {
   background: transparent;
   font-size: 13.5px;
   height: 100%;
+  outline: none; /* 容器已有 focus-within 高亮，避免双层边框 */
 }
 .search-box input::placeholder {
   color: var(--text-3);
@@ -902,19 +903,6 @@ select:focus-visible {
 }
 .toast.err {
   border-left: 3px solid var(--red);
-}
-
-/* 迁移横幅 */
-.migrate-banner {
-  background: linear-gradient(135deg, rgba(232, 179, 75, 0.12), rgba(108, 140, 255, 0.08));
-  border: 1px solid rgba(232, 179, 75, 0.3);
-  border-radius: var(--r-md);
-  padding: 12px 16px;
-  margin-bottom: 16px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
 }
 
 /* 空状态 */
