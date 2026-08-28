@@ -61,6 +61,13 @@ export interface WatchHistory {
   video_path: string | null;
 }
 
+/// 播放历史条目（界面用）：按视频去重，每个视频只出现一次，带完整视频数据
+export interface HistoryEntry {
+  video: VideoWithTags;
+  watched_at: string;
+  progress: number;
+}
+
 export interface PaginatedVideos {
   items: VideoWithTags[];
   total: number;

@@ -120,6 +120,15 @@ pub struct WatchHistory {
     pub video_path: Option<String>,
 }
 
+/// 播放历史条目（UI 用）：按视频去重后的"最近看过的片子"，带完整视频数据。
+/// 与 WatchHistory 的区别：后者是原始流水（导出/导入用），前者是给界面看的聚合结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub video: VideoWithTags,
+    pub watched_at: String,
+    pub progress: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
     pub total_found: i64,

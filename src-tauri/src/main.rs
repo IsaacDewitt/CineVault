@@ -132,6 +132,7 @@ fn main() {
             commands::toggle_series_favorite,
             commands::mark_series_watched,
             commands::update_progress,
+            commands::mark_played,
             commands::open_file,
             commands::sync_progress_from_player,
             commands::open_folder,

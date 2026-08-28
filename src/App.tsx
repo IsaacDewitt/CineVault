@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
+  HistoryEntry,
   SeriesOverview,
   Tag,
   VideoStats,
@@ -8,7 +9,6 @@ import type {
   ViewKey,
   SortKey,
   WatchStatus,
-  WatchHistory,
 } from "./types";
 import { api } from "./api";
 import { Sidebar } from "./components/Sidebar";
@@ -43,13 +43,17 @@ export default function App() {
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
   const [series, setSeries] = useState<SeriesOverview[]>([]);
-  const [history, setHistory] = useState<WatchHistory[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [stats, setStats] = useState<VideoStats | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
 
-  // 当前剧集详情
-  const [currentSeries, setCurrentSeries] = useState<SeriesOverview | null>(null);
+  // 当前剧集详情：只存 id，实体从 series 派生——
+  // 否则数据刷新后详情页仍拿着旧快照（改评分/标签后 UI 不更新，RatingPicker 与 Stars 显示两个分数）
+  const [currentSeriesId, setCurrentSeriesId] = useState<number | null>(null);
+  const currentSeries = currentSeriesId
+    ? series.find((s) => s.id === currentSeriesId) ?? null
+    : null;
 
   // 弹窗
   const [showScan, setShowScan] = useState(false);
@@ -167,43 +171,66 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, query, kind, selectedTagIds, minRating, sort, watchStatus, fetchVideos, fetchSeries, fetchHistory]);
 
-  // 从 PotPlayer 播放列表回填播放进度（无记录时静默返回 0）
-  const syncPlayerProgress = useCallback(async () => {
+  // 从 PotPlayer 播放列表回填播放进度，返回实际更新条数（无变化时为 0）。
+  // noisy=false 用于定时轮询：失败不弹 toast，否则后端一异常就每分钟弹一次。
+  const syncPlayerProgress = useCallback(async (noisy = true): Promise<number> => {
     try {
       const n = await api.syncProgressFromPlayer();
       if (n > 0) toast.ok(`已从 PotPlayer 同步 ${n} 条播放进度`);
+      return n;
     } catch (e) {
-      // 命令不存在等异常不再静默，便于发现版本不匹配
-      toast.err(`进度同步失败：${e}`);
+      if (noisy) {
+        toast.err(`进度同步失败：${e}`);
+      } else {
+        console.warn("[CineVault] 进度同步失败：", e);
+      }
+      return 0;
     }
   }, []);
 
-  // 切回窗口（从 PotPlayer 等外部应用返回）→ 自动同步进度并按当前视图刷新
+  // 同步 PotPlayer 播放记录并刷新当前视图，三路触发：
+  // - visibilitychange：最小化/切走再切回（仅此场景可靠触发）
+  // - window focus：点击窗口 / Alt-Tab 切回（窗口被遮挡时 visibilityState 不变，
+  //   必须靠 focus 兜住"切回窗口"这个最常见动作）
+  // - 60s 定时轮询：窗口一直开着没切走也能自动同步（后端增量快照幂等，开销极小）
+  // 只有真的同步到新记录才刷新视图：无条件刷新会把"加载更多"攒下的分页重置回第 0 页。
   useEffect(() => {
-    const onVis = () => {
-      if (document.visibilityState !== "visible") return;
-      syncPlayerProgress().then(() => {
-        if (view === "series") {
-          fetchSeries();
-        } else if (view === "history") {
-          fetchHistory();
-        } else if (view === "recent") {
-          api
-            .getRecentlyAdded(0, PAGE_SIZE)
-            .then((res) => {
-              setVideos(res.items);
-              setTotal(res.total);
-              setHasMore(res.has_more);
-              setPage(0);
-            })
-            .catch(() => {});
-        } else {
-          fetchVideos(0);
-        }
-      });
+    const refreshView = () => {
+      if (view === "series") {
+        fetchSeries();
+      } else if (view === "history") {
+        fetchHistory();
+      } else if (view === "recent") {
+        api
+          .getRecentlyAdded(0, PAGE_SIZE)
+          .then((res) => {
+            setVideos(res.items);
+            setTotal(res.total);
+            setHasMore(res.has_more);
+            setPage(0);
+          })
+          .catch(() => {});
+      } else {
+        fetchVideos(0);
+      }
     };
+    const onSync = async (noisy: boolean) => {
+      const n = await syncPlayerProgress(noisy);
+      if (n > 0) refreshView();
+    };
+    const onVis = () => {
+      if (document.visibilityState === "visible") void onSync(true);
+    };
+    const onFocus = () => void onSync(true);
+    const onTick = () => void onSync(false);
     document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onFocus);
+    const timer = window.setInterval(onTick, 60_000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(timer);
+    };
   }, [syncPlayerProgress, fetchVideos, fetchSeries, fetchHistory, view]);
 
   const refreshAll = useCallback(async () => {
@@ -238,6 +265,8 @@ export default function App() {
       return;
     }
     try {
+      // 点击播放即标记"最近观看"（失败不阻塞播放）
+      void api.markPlayed(v.id).catch(() => {});
       await api.openFile(v.file_path);
     } catch (e) {
       toast.err(String(e));
@@ -311,7 +340,7 @@ export default function App() {
         view={view}
         onView={(v) => {
           setView(v);
-          setCurrentSeries(null);
+          setCurrentSeriesId(null);
           // 左侧"电影"强制类型=电影；"全部视频"重置回全部，与顶栏筛选联动
           if (v === "movies") setKind("movie");
           else if (v === "all") setKind("all");
@@ -369,7 +398,7 @@ export default function App() {
           {currentSeries ? (
             <SeriesDetailView
               series={currentSeries}
-              onBack={() => setCurrentSeries(null)}
+              onBack={() => setCurrentSeriesId(null)}
               tags={tags}
               onChanged={afterDataChange}
               onOpenVideo={(v) => setDetailVideo(v)}
@@ -391,7 +420,7 @@ export default function App() {
                   series={series.filter(matchS)}
                   sort={sort}
                   onOpen={(s) => {
-                    setCurrentSeries(s);
+                    setCurrentSeriesId(s.id);
                     setSelectedTagIds([]);
                   }}
                   tags={tags}
@@ -399,7 +428,7 @@ export default function App() {
                 />
               ) : view === "history" ? (
                 <VideoList
-                  videos={historyToVideos(history).filter(matchV)}
+                  videos={history.map((h) => h.video).filter(matchV)}
                   onOpen={setDetailVideo}
                   onPlay={play}
                   onChanged={afterDataChange}
@@ -432,7 +461,7 @@ export default function App() {
         <ScanModal
           onClose={() => setShowScan(false)}
           onScanned={() => {
-            syncPlayerProgress();
+            void syncPlayerProgress();
             afterDataChange();
           }}
         />
@@ -441,7 +470,7 @@ export default function App() {
         <AddSeriesModal
           onClose={() => setShowAddSeries(false)}
           onAdded={() => {
-            syncPlayerProgress();
+            void syncPlayerProgress();
             afterDataChange();
           }}
         />
@@ -471,32 +500,4 @@ export default function App() {
       <ToastHost />
     </div>
   );
-}
-
-// 历史记录 → 视频行展示
-function historyToVideos(history: WatchHistory[]): VideoWithTags[] {
-  return history
-    .filter((h) => h.video_title || h.video_path)
-    .map((h) => ({
-      id: h.video_id,
-      title: h.video_title ?? h.video_path ?? "未知",
-      file_path: h.video_path ?? "",
-      file_name: h.video_path ?? "",
-      file_size: 0,
-      duration: null,
-      rating: 0,
-      is_favorite: false,
-      kind: "unknown" as const,
-      confidence: 0,
-      user_kind: null,
-      series_id: null,
-      series_name: null,
-      season: null,
-      episode: null,
-      last_watched_at: h.watched_at,
-      watch_progress: h.progress,
-      created_at: "",
-      updated_at: "",
-      tags: [],
-    }));
 }

@@ -91,8 +91,10 @@ export function TagManager({ onClose, onChanged }: { onClose: () => void; onChan
             <span style={{ color: "var(--text-3)", fontSize: 11.5 }}>{t.video_count ?? 0} 个</span>
             <input
               type="color"
-              value={t.color}
-              onChange={async (e) => {
+              defaultValue={t.color}
+              // 用 onBlur 而不是 onChange：取色板拖动时会逐帧触发 onChange，每帧写一次库
+              onBlur={async (e) => {
+                if (e.target.value === t.color) return;
                 try {
                   await api.updateTag(t.id, null, e.target.value);
                   await load();

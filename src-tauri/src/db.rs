@@ -57,6 +57,9 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
          CREATE INDEX IF NOT EXISTS idx_videos_kind ON videos(kind);
          CREATE INDEX IF NOT EXISTS idx_videos_series ON videos(series_id);
          CREATE INDEX IF NOT EXISTS idx_videos_file_name ON videos(file_name);
+         CREATE INDEX IF NOT EXISTS idx_videos_file_path ON videos(file_path);
+         -- PotPlayer 同步按路径匹配时用的是 COLLATE NOCASE，普通 BINARY 索引在那条查询上不生效
+         CREATE INDEX IF NOT EXISTS idx_videos_file_path_nocase ON videos(file_path COLLATE NOCASE);
          CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -80,6 +83,14 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             progress REAL NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS idx_watch_history_video ON watch_history(video_id);
+         -- 去重索引：让各处 INSERT OR IGNORE 真正生效（同一视频同一时刻同一进度只留一条）。
+         -- 必须在这里建而不能只靠 migrator，否则全新库会退化成每条都插，历史被同一部片子刷屏。
+         -- 建索引前先清存量重复（老库/导入场景可能已有），否则 CREATE UNIQUE INDEX 会直接失败。
+         DELETE FROM watch_history WHERE id NOT IN (
+            SELECT MIN(id) FROM watch_history GROUP BY video_id, watched_at, progress
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_history_dedup
+            ON watch_history(video_id, watched_at, progress);
          CREATE TABLE IF NOT EXISTS scan_folders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             folder_path TEXT NOT NULL UNIQUE,
@@ -110,6 +121,13 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), AppE
         params![key, value],
     )?;
     Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, AppError> {
+    let v = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+        .optional()?;
+    Ok(v)
 }
 
 // ============================================
@@ -158,12 +176,29 @@ fn row_to_series_overview(row: &Row) -> rusqlite::Result<SeriesOverview> {
     })
 }
 
-const SERIES_OVERVIEW_COLS: &str = "se.id, se.name, se.folder_path,
-    (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id) AS total_episodes,
-    (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id AND EXISTS (SELECT 1 FROM watch_history h WHERE h.video_id = v.id)) AS watched_episodes,
-    (SELECT COALESCE(MAX(v.watch_progress), 0) FROM videos v WHERE v.series_id = se.id) AS progress,
-    (SELECT COALESCE(SUM(v.file_size), 0) FROM videos v WHERE v.series_id = se.id) AS total_size,
-    se.rating, se.is_favorite, se.last_watched_at, se.updated_at";
+/// 一集算"看过"的判定：watch_progress >= 99.9，与前端 VideoList.watched() 保持一致。
+/// 剧集聚合（已看集数 / 进度）必须同源，否则卡片会同时显示"已看 1/46 集"和"进度条 100%"——
+/// 旧实现 progress 取 MAX(单集进度)，看 1 集就满格，与旁边的集数自相矛盾。
+fn series_progress_expr(series_alias: &str) -> String {
+    format!(
+        "(SELECT CASE WHEN COUNT(*) = 0 THEN 0.0 \
+         ELSE 100.0 * SUM(CASE WHEN v.watch_progress >= 99.9 THEN 1 ELSE 0 END) / COUNT(*) END \
+         FROM videos v WHERE v.series_id = {}.id)",
+        series_alias
+    )
+}
+
+fn series_overview_cols() -> String {
+    format!(
+        "se.id, se.name, se.folder_path,
+         (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id) AS total_episodes,
+         (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id AND v.watch_progress >= 99.9) AS watched_episodes,
+         {} AS progress,
+         (SELECT COALESCE(SUM(v.file_size), 0) FROM videos v WHERE v.series_id = se.id) AS total_size,
+         se.rating, se.is_favorite, se.last_watched_at, se.updated_at",
+        series_progress_expr("se")
+    )
+}
 
 // ============================================
 // 视频 CRUD（含移动匹配迁移）
@@ -196,35 +231,38 @@ pub fn upsert_video(
     // 2. 移动匹配（两级，旧文件已不在磁盘才认领）：
     //    2a. 剧集锚点：新文件带剧集归属时，只在本剧集内找同名（文件夹=剧集，杜绝跨剧集重名串记录）
     //    2b. 全库唯一同名：无歧义时认领，保留历史 series_id 归属（电影移动 / 剧集文件夹改名场景）
+    // 注意：rusqlite 的 params![] 是按**位置顺序**绑定到 1..n，不是按 SQL 里写的 ?N 编号。
+    // 因此 SQL 中的参数序号必须连续；跳号（如 ?1?2?3?5）会让 bind_parameter_count 大于实参个数，
+    // 直接抛 InvalidParameterCount。改动这两条 UPDATE 时务必重编号。
     if move_match {
         if let Some(sid) = p.series_id {
-            let hit: Option<(i64, String, Option<String>)> = tx
+            let hit: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT id, file_path, user_kind FROM videos WHERE file_name = ?1 AND series_id = ?2 ORDER BY id LIMIT 1",
+                    "SELECT id, file_path FROM videos WHERE file_name = ?1 AND series_id = ?2 ORDER BY id LIMIT 1",
                     params![p.file_name, sid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            if let Some((old_id, old_path, old_user_kind)) = hit {
+            if let Some((old_id, old_path)) = hit {
                 if old_path != p.file_path && !std::path::Path::new(&old_path).exists() {
                     tx.execute(
                         "UPDATE videos SET file_path=?1, title=?2, file_size=?3, series_id=?4,
                          season=COALESCE(?5, season), episode=COALESCE(?6, episode),
                          user_kind=COALESCE(user_kind, ?7),
                          updated_at=datetime('now','localtime') WHERE id=?8",
-                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, old_user_kind, old_id],
+                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, p.user_kind, old_id],
                     )?;
                     return Ok(UpsertResult::Updated(old_id));
                 }
             }
         }
         // 2b. 全库唯一同名才认领（多条同名 = 有歧义，宁插入不串记录）
-        let same_name: Vec<(i64, String, Option<String>)> = {
+        let same_name: Vec<(i64, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, file_path, user_kind FROM videos WHERE file_name = ?1 ORDER BY id",
+                "SELECT id, file_path FROM videos WHERE file_name = ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(params![p.file_name], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?))
             })?;
             let mut v = Vec::new();
             for r in rows {
@@ -235,14 +273,14 @@ pub fn upsert_video(
             v
         };
         if same_name.len() == 1 {
-            let (old_id, old_path, old_user_kind) = same_name[0].clone();
+            let (old_id, old_path) = same_name[0].clone();
             if old_path != p.file_path && !std::path::Path::new(&old_path).exists() {
                 tx.execute(
                     "UPDATE videos SET file_path=?1, title=?2, file_size=?3,
-                     season=COALESCE(?5, season), episode=COALESCE(?6, episode),
-                     user_kind=COALESCE(user_kind, ?7),
-                     updated_at=datetime('now','localtime') WHERE id=?8",
-                    params![p.file_path, p.title, p.file_size, p.season, p.episode, old_user_kind, old_id],
+                     season=COALESCE(?4, season), episode=COALESCE(?5, episode),
+                     user_kind=COALESCE(user_kind, ?6),
+                     updated_at=datetime('now','localtime') WHERE id=?7",
+                    params![p.file_path, p.title, p.file_size, p.season, p.episode, p.user_kind, old_id],
                 )?;
                 return Ok(UpsertResult::Updated(old_id));
             }
@@ -372,10 +410,8 @@ pub fn get_recently_added_videos(
     page_size: i64,
     min_rating: f64,
 ) -> Result<PaginatedVideos, AppError> {
-    let mut conditions = vec!["datetime(v.created_at) >= datetime('now', '-7 days')".to_string()];
-    if min_rating > 0.0 {
-        conditions.push(format!("v.rating >= {}", min_rating));
-    }
+    // min_rating 由 query_videos_paginated 内部追加，这里不要再 push 一次（否则 SQL 出现重复条件）
+    let conditions = vec!["datetime(v.created_at) >= datetime('now', '-7 days')".to_string()];
     let params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     query_videos_paginated(conn, &conditions, &param_refs, page, page_size, min_rating, "updated")
@@ -407,7 +443,7 @@ pub fn upsert_series(conn: &Connection, name: &str, folder: Option<&str>) -> Res
 pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, AppError> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM series se ORDER BY se.name COLLATE NOCASE",
-        SERIES_OVERVIEW_COLS
+        series_overview_cols()
     ))?;
     let rows = stmt.query_map([], row_to_series_overview)?;
     let mut list = Vec::new();
@@ -506,13 +542,8 @@ pub fn update_watch_progress(conn: &Connection, video_id: i64, progress: f64) ->
         "INSERT INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
         params![video_id, now, progress],
     )?;
-    // 每个视频最多保留最近 50 条历史，防 DB 无限膨胀（idx_watch_history_video 加速）
-    conn.execute(
-        "DELETE FROM watch_history WHERE id IN (
-            SELECT id FROM watch_history WHERE video_id = ?1 ORDER BY id DESC LIMIT -1 OFFSET 50
-        )",
-        params![video_id],
-    )?;
+    // 每个视频最多保留最近 50 条历史，防 DB 无限膨胀
+    trim_history(conn, video_id)?;
     // 剧集进度同步到实体
     if let Some(sid) = conn
         .query_row("SELECT series_id FROM videos WHERE id = ?1", params![video_id], |r| r.get::<_, Option<i64>>(0))
@@ -520,11 +551,121 @@ pub fn update_watch_progress(conn: &Connection, video_id: i64, progress: f64) ->
         .flatten()
     {
         conn.execute(
-            "UPDATE series SET last_watched_at = ?1, watch_progress = (SELECT COALESCE(MAX(v.watch_progress), 0) FROM videos v WHERE v.series_id = ?2), updated_at = datetime('now','localtime') WHERE id = ?2",
+            &format!(
+                "UPDATE series SET last_watched_at = ?1, watch_progress = {}, updated_at = datetime('now','localtime') WHERE id = ?2",
+                series_progress_expr("series")
+            ),
             params![now, sid],
         )?;
     }
     Ok(())
+}
+
+/// 标记"刚刚点击播放"：只刷新最近播放时间 + 写一条观看历史，不动 watch_progress 百分比。
+/// 这是"从 CineVault 点播放 → 立即成为最近观看"的最可靠记录时机，不依赖播放器状态。
+pub fn mark_played(conn: &Connection, video_id: i64) -> Result<(), AppError> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE videos SET last_watched_at = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
+        params![now, video_id],
+    )?;
+    // 历史记录里记当前进度，表示"点播放时看到哪"
+    let prog: f64 = conn
+        .query_row("SELECT watch_progress FROM videos WHERE id = ?1", params![video_id], |r| r.get(0))
+        .unwrap_or(0.0);
+    conn.execute(
+        "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
+        params![video_id, now, prog],
+    )?;
+    trim_history(conn, video_id)?;
+    sync_series_aggregate(conn, video_id)?;
+    Ok(())
+}
+
+/// 每个视频的 watch_history 最多保留最近 50 条，防 DB 无限膨胀
+pub fn trim_history(conn: &Connection, video_id: i64) -> Result<(), AppError> {
+    conn.execute(
+        "DELETE FROM watch_history WHERE id IN (
+            SELECT id FROM watch_history WHERE video_id = ?1 ORDER BY id DESC LIMIT -1 OFFSET 50
+        )",
+        params![video_id],
+    )?;
+    Ok(())
+}
+
+/// 视频进度/最近播放变化后，把剧集聚合字段刷到最新（剧集卡片排序/进度条数据源）
+pub fn sync_series_aggregate(conn: &Connection, video_id: i64) -> Result<(), AppError> {
+    if let Some(sid) = conn
+        .query_row("SELECT series_id FROM videos WHERE id = ?1", params![video_id], |r| r.get::<_, Option<i64>>(0))
+        .optional()?
+        .flatten()
+    {
+        conn.execute(
+            &format!(
+                "UPDATE series SET
+                    last_watched_at = (SELECT MAX(v.last_watched_at) FROM videos v WHERE v.series_id = series.id),
+                    watch_progress = {},
+                    updated_at = datetime('now','localtime')
+                 WHERE id = ?1",
+                series_progress_expr("series")
+            ),
+            params![sid],
+        )?;
+    }
+    Ok(())
+}
+
+/// 最近看过的片子（UI 用）：按 video_id 去重，每个视频只保留最近一条，并带回完整视频数据。
+/// 不去重的话同一部片子反复播放会在列表里刷屏（生产库曾出现单视频 6 条、平均 2 条/视频）。
+pub fn get_history_entries(conn: &Connection, limit: i64) -> Result<Vec<HistoryEntry>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT video_id, watched_at, progress FROM (
+            SELECT video_id, watched_at, progress,
+                   ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY watched_at DESC, id DESC) AS rn
+            FROM watch_history
+         ) WHERE rn = 1
+         ORDER BY watched_at DESC, video_id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+    })?;
+    let mut picked: Vec<(i64, String, f64)> = Vec::new();
+    for r in rows {
+        if let Ok(x) = r {
+            picked.push(x);
+        }
+    }
+
+    let ids: Vec<i64> = picked.iter().map(|(id, _, _)| *id).collect();
+    let mut videos: HashMap<i64, VideoWithTags> = HashMap::new();
+    if !ids.is_empty() {
+        let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT {} FROM videos v LEFT JOIN series s ON s.id = v.series_id WHERE v.id IN ({})",
+            VIDEO_COLS,
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(refs.as_slice(), row_to_video)?;
+        for r in rows {
+            if let Ok(v) = r {
+                videos.insert(v.id, VideoWithTags { video: v, tags: Vec::new() });
+            }
+        }
+    }
+    let tag_map = load_tags_for(conn, &ids)?;
+
+    Ok(picked
+        .into_iter()
+        .filter_map(|(vid, watched_at, progress)| {
+            videos.remove(&vid).map(|mut vwt| {
+                vwt.tags = tag_map.get(&vid).cloned().unwrap_or_default();
+                HistoryEntry { video: vwt, watched_at, progress }
+            })
+        })
+        .collect())
 }
 
 pub fn get_watch_history(conn: &Connection, limit: i64) -> Result<Vec<WatchHistory>, AppError> {
@@ -897,6 +1038,9 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
 
     // 4. 视频（同路径 upsert，不启用移动匹配——导入来自另一台机器不应改写本地路径）
     let mut video_count = 0i64;
+    // 导出库 video_id -> 本库 video_id。播放历史必须走这层映射：
+    // id 是 AUTOINCREMENT，导出方的 123 号在本库是另一部片子，直接用会把历史挂错视频。
+    let mut video_id_map: HashMap<i64, i64> = HashMap::new();
     for vwt in &data.videos {
         let v = &vwt.video;
         let series_id = v.series_name.as_ref().and_then(|n| series_id_by_name.get(n).copied());
@@ -919,6 +1063,7 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
             false,
         )?;
         let vid = result.id();
+        video_id_map.insert(v.id, vid);
         // 评分/收藏/进度（导入值优先）
         tx.execute(
             "UPDATE videos SET rating = ?1, is_favorite = ?2, watch_progress = ?3, last_watched_at = COALESCE(last_watched_at, ?4)
@@ -937,14 +1082,16 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
         video_count += 1;
     }
 
-    // 5. 播放历史（按 video_id 直导，冲突忽略）
+    // 5. 播放历史（经 video_id_map 换算成本库 id 再写；映射不到说明视频未导入，丢弃）
     let mut history_count = 0i64;
     for h in &data.watch_history {
-        tx.execute(
-            "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
-            params![h.video_id, h.watched_at, h.progress],
-        )?;
-        history_count += 1;
+        if let Some(&vid) = video_id_map.get(&h.video_id) {
+            tx.execute(
+                "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
+                params![vid, h.watched_at, h.progress],
+            )?;
+            history_count += 1;
+        }
     }
 
     tx.commit()?;
@@ -976,4 +1123,148 @@ pub fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, AppError> {
 
 pub fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_database(&conn).unwrap();
+        conn
+    }
+
+    fn vp<'a>(title: &'a str, path: &'a str, name: &'a str) -> VideoUpsertParams<'a> {
+        VideoUpsertParams {
+            title,
+            file_path: path,
+            file_name: name,
+            file_size: 1024,
+            duration: None,
+            kind: "movie",
+            confidence: 80,
+            user_kind: None,
+            series_id: None,
+            season: None,
+            episode: None,
+            default_watched: false,
+        }
+    }
+
+    /// 回归：2b 分支的 UPDATE 曾写成 `?1?2?3?5?6?7?8`（删 series_id=?4 时漏重编号）却只传 7 个值，
+    /// rusqlite 按位置绑定后抛 InvalidParameterCount(7,8)，命令层当成普通错误吞掉 →
+    /// 移动过的电影重新扫描时既不认领也不插入，记录凭空消失。
+    #[test]
+    fn move_match_claims_orphan_record() {
+        let mut conn = mem_db();
+        let old = {
+            let mut p = std::env::temp_dir();
+            p.push("cinevault_test_never_created");
+            p.push("Inception.2010.mkv");
+            p.to_string_lossy().to_string()
+        };
+        assert!(
+            !std::path::Path::new(&old).exists(),
+            "旧路径必须不存在才会触发移动匹配"
+        );
+
+        let tx = conn.transaction().unwrap();
+        let first = upsert_video(&tx, &vp("Inception.2010", &old, "Inception.2010.mkv"), false).unwrap();
+        assert!(first.is_inserted());
+        let id = first.id();
+        tx.commit().unwrap();
+
+        // 文件挪到新位置后重新 upsert：应认领旧记录，而不是插一条新的
+        let new = "E:/电影房/Inception.2010.mkv";
+        let tx = conn.transaction().unwrap();
+        let second = upsert_video(&tx, &vp("Inception.2010", new, "Inception.2010.mkv"), true).unwrap();
+        assert!(!second.is_inserted(), "应认领旧记录而非插入新行");
+        assert_eq!(second.id(), id);
+        tx.commit().unwrap();
+
+        let stored: String = conn
+            .query_row("SELECT file_path FROM videos WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, new, "记录的 file_path 应迁移到新位置");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM videos WHERE file_name = 'Inception.2010.mkv'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "不应产生重复行");
+    }
+
+    /// 剧集进度 = 已看集数 / 总集数，与 watched_episodes 同源。
+    /// 旧实现取 MAX(单集进度)：看 1/46 集就显示整剧 100%，与卡片上的"已看 1/46 集"自相矛盾。
+    #[test]
+    fn series_progress_tracks_watched_ratio() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let sid = upsert_series(&tx, "测试剧", None).unwrap();
+        let mut ids = Vec::new();
+        for ep in 1..=4 {
+            let p = VideoUpsertParams {
+                title: "测试剧",
+                file_path: &format!("/t/测试剧.S01E0{}.mkv", ep),
+                file_name: &format!("测试剧.S01E0{}.mkv", ep),
+                file_size: 100,
+                duration: None,
+                kind: "series",
+                confidence: 90,
+                user_kind: None,
+                series_id: Some(sid),
+                season: Some(1),
+                episode: Some(ep),
+                default_watched: false,
+            };
+            ids.push(upsert_video(&tx, &p, false).unwrap().id());
+        }
+        tx.commit().unwrap();
+
+        let ratio = |conn: &Connection| -> (i64, i64, f64) {
+            let list = get_series_overview(conn).unwrap();
+            let s = &list[0];
+            (s.watched_episodes, s.total_episodes, s.progress)
+        };
+
+        assert_eq!(ratio(&conn), (0, 4, 0.0), "都没看 → 0%");
+
+        // 看完 1 集 → 25%，而不是 100%
+        conn.execute("UPDATE videos SET watch_progress = 100 WHERE id = ?1", params![ids[0]]).unwrap();
+        assert_eq!(ratio(&conn), (1, 4, 25.0), "看 1/4 集 → 25%");
+
+        // 再看一集看到一半（不计入已看）→ 仍是 25%
+        conn.execute("UPDATE videos SET watch_progress = 50 WHERE id = ?1", params![ids[1]]).unwrap();
+        assert_eq!(ratio(&conn), (1, 4, 25.0), "半看的集不计入已看数");
+
+        // 全剧标记已看 → 100%（mark_series_watched 只改 watch_progress，也必须反映到已看集数）
+        mark_series_watched(&conn, sid, true).unwrap();
+        assert_eq!(ratio(&conn), (4, 4, 100.0), "全剧标记已看 → 4/4 且 100%");
+    }
+
+    /// 播放历史按视频去重：同一部片子反复播放只保留一条，且带回完整视频数据
+    #[test]
+    fn history_entries_dedup_per_video() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let a = upsert_video(&tx, &vp("A", "/t/A.mkv", "A.mkv"), false).unwrap().id();
+        let b = upsert_video(&tx, &vp("B", "/t/B.mkv", "B.mkv"), false).unwrap().id();
+        tx.commit().unwrap();
+
+        for (i, vid) in [a, a, b, a].iter().enumerate() {
+            conn.execute(
+                "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
+                params![vid, format!("2026-08-28 00:00:0{}", i), i as f64],
+            )
+            .unwrap();
+        }
+
+        let entries = get_history_entries(&conn, 50).unwrap();
+        assert_eq!(entries.len(), 2, "两个视频应各只出现一次");
+        // 按最近时间倒序：A 的最后一条是 00:00:03（进度 3）
+        // VideoWithTags 是 flatten 结构，Rust 侧要写 .video.video.id（序列化后是扁平的）
+        assert_eq!(entries[0].video.video.id, a);
+        assert!((entries[0].progress - 3.0).abs() < f64::EPSILON, "应取该视频最近一条的进度");
+        assert_eq!(entries[0].video.video.file_size, 1024, "应带回完整视频数据");
+        assert_eq!(entries[1].video.video.id, b);
+    }
 }

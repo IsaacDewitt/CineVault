@@ -7,12 +7,12 @@ import type {
   RefreshResult,
   ScanFolder,
   ScanResult,
+  HistoryEntry,
   SeriesOverview,
   Tag,
   VideoKind,
   VideoStats,
   VideoWithTags,
-  WatchHistory,
 } from "./types";
 
 // ============================================
@@ -58,7 +58,7 @@ export const api = {
     invoke<VideoWithTags[]>("get_series_episodes", { seriesId }),
   getVideoDetail: (videoId: number) =>
     invoke<VideoWithTags>("get_video_detail", { videoId }),
-  getHistory: (limit = 60) => invoke<WatchHistory[]>("get_history", { limit }),
+  getHistory: (limit = 60) => invoke<HistoryEntry[]>("get_history", { limit }),
   getStats: () => invoke<VideoStats>("get_stats"),
 
   // 标签
@@ -90,6 +90,7 @@ export const api = {
     invoke<number>("mark_series_watched", { seriesId, watched }),
   updateProgress: (videoId: number, progress: number) =>
     invoke("update_progress", { videoId, progress }),
+  markPlayed: (videoId: number) => invoke("mark_played", { videoId }),
   openFile: (path: string) => invoke("open_file", { path }),
   syncProgressFromPlayer: () => invoke<number>("sync_progress_from_player"),
   openFolder: (path: string) => invoke("open_folder", { path }),

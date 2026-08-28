@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use rusqlite::{params, OptionalExtension};
 use tauri::State;
 
 use crate::db::DbConn;
@@ -40,12 +39,16 @@ fn apply_series(
 fn match_folder_anchor(file_path: &str, anchors: &[(i64, String)]) -> Option<i64> {
     let norm = |p: &str| p.trim_end_matches(|c| c == '/' || c == '\\').to_lowercase();
     let fp = norm(file_path);
+    // 用字节前缀比较，不要写 fp[..f.len()] == f：锚点路径含 2 字节 UTF-8 字符时，
+    // 切片位置可能落在多字节字符中间，直接 panic。
+    let fp_bytes = fp.as_bytes();
     let mut best: Option<(usize, i64)> = None;
     for (sid, folder) in anchors {
         let f = norm(folder);
-        if f.is_empty() || fp.len() < f.len() || fp[..f.len()] != f {
+        if f.is_empty() || fp.len() < f.len() || !fp_bytes.starts_with(f.as_bytes()) {
             continue;
         }
+        // 走到这里说明前 f.len() 字节正好是 f（合法 UTF-8），f.len() 一定是 fp 的字符边界
         // 必须落在目录边界（folder 是文件本身所在目录的祖先），避免 H:\剧 误配 H:\剧集
         let boundary_ok = fp.len() == f.len()
             || fp[f.len()..]
@@ -518,10 +521,11 @@ pub fn get_video_detail(db: State<'_, DbConn>, video_id: i64) -> Result<VideoWit
     crate::db::get_video_by_id(&conn, video_id).map_err(|e| e.to_string())
 }
 
+/// 播放历史（界面用）：按视频去重，每个视频只出现一次，带完整视频数据
 #[tauri::command]
-pub fn get_history(db: State<'_, DbConn>, limit: Option<i64>) -> Result<Vec<WatchHistory>, String> {
+pub fn get_history(db: State<'_, DbConn>, limit: Option<i64>) -> Result<Vec<HistoryEntry>, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    crate::db::get_watch_history(&conn, limit.unwrap_or(60)).map_err(|e| e.to_string())
+    crate::db::get_history_entries(&conn, limit.unwrap_or(60)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -644,6 +648,14 @@ pub fn update_progress(db: State<'_, DbConn>, video_id: i64, progress: f64) -> R
     crate::db::update_watch_progress(&conn, video_id, progress).map_err(|e| e.to_string())
 }
 
+/// 点击播放即标记"最近观看"：刷新 last_watched_at + 写一条观看历史（不动进度百分比）。
+/// 前端 play() 打开播放器前调用，这是最可靠的"看过"记录时机。
+#[tauri::command]
+pub fn mark_played(db: State<'_, DbConn>, video_id: i64) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::mark_played(&conn, video_id).map_err(|e| e.to_string())
+}
+
 // ============================================
 // 文件操作
 // ============================================
@@ -656,95 +668,184 @@ pub fn open_file(path: String) -> Result<(), String> {
     open::that(&path).map_err(|e| e.to_string())
 }
 
-/// 解析 PotPlayer 播放列表 dpl，把最近播放位置回填到 watch_progress
-/// 进度只升不降（避免覆盖已看 / 手动进度）；同时刷新 last_watched_at 喂给"最近播放"排序
-/// 带 dpl 修改时间缓存：文件未变化直接返回 0（前端可无脑轮询）
+/// 从 PotPlayer 回填播放记录。
+/// 数据源（按可靠性）：
+///   1. 注册表 HKCU\Software\Daum\PotPlayerMini64\RememberFiles —— PotPlayer 位置记忆（权威）
+///      格式：<序号> REG_SZ <位置毫秒>=<文件路径>，如 "295 REG_SZ 649035=E:\...\Trial...mkv"
+///   2. dpl %APPDATA%\PotPlayerMini64\Playlist\PotPlayerMini64.dpl 的 playname=（最近打开的文件）
+///      以及条目里的 start*/duration2*（PotPlayer 播放中会写位置时）
+/// 增量语义：把上次见过的 {path: 位置} 快照存 settings，只有"新出现 / 位置变化 / playname 切换"
+/// 的文件才刷新最近播放 + 写观看历史，避免每次同步把所有历史播放全刷成"现在"。
+/// 进度只升不降；无时长数据时只记"看过"（最近播放/历史），百分比待扫描补 duration 后自动生效。
 #[tauri::command]
 pub fn sync_progress_from_player(db: State<'_, DbConn>) -> Result<i64, String> {
-    static LAST_DPL_MTIME: Mutex<Option<SystemTime>> = Mutex::new(None);
+    // ========== 1. 收集播放证据：path -> (位置毫秒, 时长毫秒) ==========
+    let mut evidence: HashMap<String, (Option<u64>, Option<u64>)> = HashMap::new();
 
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(r"Software\Daum\PotPlayerMini64\RememberFiles", KEY_READ)
+        {
+            for item in key.enum_values() {
+                let Ok((_, value)) = item else { continue };
+                if value.vtype != RegType::REG_SZ {
+                    continue; // 跳过 19_a / 280_c1 等辅助 REG_DWORD 键
+                }
+                // REG_SZ 是 UTF-16LE，可能带尾部 \0
+                let units: Vec<u16> = value
+                    .bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let s = String::from_utf16_lossy(&units);
+                let s = s.trim_end_matches('\0').trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let Some(eq) = s.find('=') else { continue };
+                let (ms, path) = s.split_at(eq);
+                let path = path[1..].trim().to_string();
+                if path.is_empty() {
+                    continue;
+                }
+                let pos: Option<u64> = ms.trim().parse().ok();
+                let entry = evidence.entry(path).or_insert((None, None));
+                if pos.is_some() {
+                    entry.0 = pos; // 注册表位置优先
+                }
+            }
+        }
+    }
+
+    // dpl 兜底：playname 是最近打开/播放的文件；条目里顺带收 start/duration2（若 PotPlayer 写了）
+    let mut playname: Option<String> = None;
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let dpl = Path::new(&appdata)
         .join("PotPlayerMini64")
         .join("Playlist")
         .join("PotPlayerMini64.dpl");
-    if !dpl.exists() {
+    if dpl.exists() {
+        if let Ok(content) = std::fs::read_to_string(&dpl) {
+            for line in content.lines() {
+                if let Some(p) = line.strip_prefix("playname=") {
+                    let p = p.trim();
+                    if !p.is_empty() {
+                        playname = Some(p.to_string());
+                        evidence.entry(p.to_string()).or_insert((None, None));
+                    }
+                    break;
+                }
+            }
+            let mut entries: HashMap<u32, (Option<String>, Option<u64>, Option<u64>)> = HashMap::new();
+            for line in content.lines() {
+                let Some(star) = line.find('*') else { continue };
+                let Ok(idx) = line[..star].parse::<u32>() else { continue };
+                let rest = &line[star + 1..];
+                let e = entries.entry(idx).or_default();
+                if let Some(p) = rest.strip_prefix("file*") {
+                    e.0 = Some(p.trim().to_string());
+                } else if let Some(p) = rest.strip_prefix("start*") {
+                    e.1 = p.trim().parse().ok();
+                } else if let Some(p) = rest
+                    .strip_prefix("duration2*")
+                    .or_else(|| rest.strip_prefix("duration*"))
+                {
+                    e.2 = p.trim().parse().ok();
+                }
+            }
+            for (_, (file, start, dur)) in entries {
+                if let Some(f) = file {
+                    let entry = evidence.entry(f).or_insert((None, None));
+                    if entry.0.is_none() {
+                        entry.0 = start; // dpl start 只在注册表没有时补充
+                    }
+                    if dur.is_some() {
+                        entry.1 = dur;
+                    }
+                }
+            }
+        }
+    }
+    if evidence.is_empty() {
         return Ok(0);
     }
-    // mtime 未变化 → 无新进度可读
-    let mtime = std::fs::metadata(&dpl).and_then(|m| m.modified()).ok();
-    if let Ok(last) = LAST_DPL_MTIME.lock() {
-        if *last == mtime {
-            return Ok(0);
-        }
-    }
-    let content = std::fs::read_to_string(&dpl).map_err(|e| e.to_string())?;
-    // 读取成功后才更新缓存（避免读取失败后一直不重试）
-    if let Ok(mut last) = LAST_DPL_MTIME.lock() {
-        *last = mtime;
-    }
 
-    // 聚合列表项：N*file*path / N*start*ms / N*duration2*ms
-    #[derive(Default)]
-    struct Entry {
-        file: Option<String>,
-        start_ms: Option<u64>,
-        duration_ms: Option<u64>,
-    }
-    let mut entries: HashMap<u32, Entry> = HashMap::new();
-    for line in content.lines() {
-        let Some(star) = line.find('*') else { continue };
-        let Ok(idx) = line[..star].parse::<u32>() else { continue };
-        let rest = &line[star + 1..];
-        let e = entries.entry(idx).or_default();
-        if let Some(p) = rest.strip_prefix("file*") {
-            e.file = Some(p.to_string());
-        } else if let Some(p) = rest.strip_prefix("start*") {
-            e.start_ms = p.trim().parse().ok();
-        } else if let Some(p) = rest
-            .strip_prefix("duration2*")
-            .or_else(|| rest.strip_prefix("duration*"))
-        {
-            e.duration_ms = p.trim().parse().ok();
-        }
-    }
-
+    // ========== 2. 增量检测：只处理新出现 / 位置变化 / playname 切换 ==========
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    let last_raw: Option<String> = crate::db::get_setting(&conn, "potplayer_evidence_snapshot")
+        .map_err(|e| e.to_string())?;
+    let parsed_snapshot = last_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, u64>>(raw).ok());
+    // 快照从未建立（或损坏）→ 首轮同步：只建立基线，不写任何库。
+    // 否则 RememberFiles 里全部库内文件会被当成"新播放"批量刷新，
+    // 把历史最近播放全刷成同一时刻（2026-08-28 事故根因）。
+    let is_first_sync = parsed_snapshot.is_none();
+    let last_map = parsed_snapshot.unwrap_or_default();
+    let last_playname: Option<String> =
+        crate::db::get_setting(&conn, "potplayer_dpl_playname").map_err(|e| e.to_string())?;
+    let playname_switched = last_playname.as_deref() != playname.as_deref();
+
+    let now = now_str();
+    let mut new_snapshot: HashMap<String, u64> = HashMap::new();
     let mut updated: i64 = 0;
-    for e in entries.values() {
-        let (Some(path), Some(start), Some(dur)) = (&e.file, e.start_ms, e.duration_ms) else {
-            continue;
-        };
-        if start == 0 || dur == 0 {
+
+    for (path, (pos, dur)) in &evidence {
+        let pos_val = pos.unwrap_or(0);
+        new_snapshot.insert(path.clone(), pos_val);
+        let is_playname = playname.as_deref() == Some(path.as_str());
+        // 首轮只建档（playname 除外——它代表正在播放的文件，值得立即记录）
+        if is_first_sync && !is_playname {
             continue;
         }
-        let progress = ((start as f64) / (dur as f64) * 100.0).clamp(0.0, 100.0);
-        // 进度只升不降；升了才更新进度 + 最近播放时间
-        let n = conn
-            .execute(
-                "UPDATE videos SET watch_progress = ?1, last_watched_at = datetime('now','localtime'), updated_at = datetime('now','localtime')
-                 WHERE file_path = ?2 COLLATE NOCASE AND watch_progress < ?1",
-                rusqlite::params![progress, path],
+        let pos_changed = last_map.get(path).copied() != Some(pos_val);
+        // playname 切换 → 无条件视为"刚打开播放"；否则依赖位置变化
+        if !pos_changed && !(is_playname && playname_switched) {
+            continue;
+        }
+        // 匹配库内视频（无 file_path 索引时全表扫描，5000 行量级可接受）
+        let row = conn
+            .query_row(
+                "SELECT id, watch_progress FROM videos WHERE file_path = ?1 COLLATE NOCASE",
+                params![path],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
             )
+            .optional()
             .map_err(|e| e.to_string())?;
-        updated += n as i64;
-        // 进度未升（如重看开头）也刷新最近播放时间，保证"最近播放"排序有新数据
+        let Some((vid, cur_progress)) = row else {
+            continue; // 库外文件（PotPlayer 里看了但不在库里），跳过
+        };
+        // 进度只升不降；有位置+时长才算百分比，否则维持现值（至少记"看过"）
+        let mut final_progress = cur_progress;
+        if let (Some(p), Some(d)) = (*pos, *dur) {
+            if p > 0 && d > 0 {
+                final_progress = ((p as f64) / (d as f64) * 100.0).clamp(0.0, 100.0);
+            }
+        }
         conn.execute(
-            "UPDATE videos SET last_watched_at = datetime('now','localtime')
-             WHERE file_path = ?1 COLLATE NOCASE AND watch_progress >= ?2",
-            rusqlite::params![path, progress],
+            "UPDATE videos SET watch_progress = MAX(watch_progress, ?1), last_watched_at = ?2, updated_at = datetime('now','localtime') WHERE id = ?3",
+            params![final_progress, now, vid],
         )
         .map_err(|e| e.to_string())?;
-        // 同步其所属剧集的聚合字段（剧集卡片排序/进度条数据源）
         conn.execute(
-            "UPDATE series SET
-                last_watched_at = (SELECT MAX(v.last_watched_at) FROM videos v WHERE v.series_id = series.id),
-                watch_progress = (SELECT COALESCE(MAX(v.watch_progress), 0) FROM videos v WHERE v.series_id = series.id),
-                updated_at = datetime('now','localtime')
-             WHERE id IN (SELECT DISTINCT series_id FROM videos WHERE file_path = ?1 COLLATE NOCASE AND series_id IS NOT NULL)",
-            rusqlite::params![path],
+            "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
+            params![vid, now, final_progress],
         )
         .map_err(|e| e.to_string())?;
+        crate::db::trim_history(&conn, vid).map_err(|e| e.to_string())?;
+        crate::db::sync_series_aggregate(&conn, vid).map_err(|e| e.to_string())?;
+        updated += 1;
+    }
+
+    // 快照写回（含库外文件：位置变化是纯外部事实，与是否入库无关）
+    if let Ok(snap_json) = serde_json::to_string(&new_snapshot) {
+        let _ = crate::db::set_setting(&conn, "potplayer_evidence_snapshot", &snap_json);
+    }
+    if let Some(p) = playname {
+        let _ = crate::db::set_setting(&conn, "potplayer_dpl_playname", &p);
     }
     Ok(updated)
 }

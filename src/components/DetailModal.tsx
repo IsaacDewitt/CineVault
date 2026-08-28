@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import type { Tag, VideoWithTags } from "../types";
 import { api } from "../api";
-import { Modal, RatingPicker, toast } from "./ui";
+import { Modal, RatingPicker, formatSize, toast } from "./ui";
 
 export function DetailModal({
   video,
@@ -151,7 +151,7 @@ export function DetailModal({
       <div className="detail-row">
         <label>大小</label>
         <span className="val">
-          {(video.file_size / 1024 / 1024 / 1024).toFixed(2)} GB
+          {formatSize(video.file_size)}
           {video.duration ? ` · ${Math.round(video.duration / 60)} 分钟` : ""}
         </span>
       </div>

@@ -5,6 +5,10 @@ import type { Tag, VideoKind } from "../types";
 // 通用 UI 件
 // ============================================
 
+// Esc 关闭只允许最上层弹窗响应：PendingModal 里是 Modal 套 Modal，
+// 若无条件响应会把内外两层一起关掉。用栈记录层级，栈顶才吃 Esc。
+const modalStack: symbol[] = [];
+
 export function Modal({
   title,
   onClose,
@@ -18,6 +22,24 @@ export function Modal({
   footer?: React.ReactNode;
   wide?: boolean;
 }) {
+  const token = React.useRef<symbol>(Symbol("modal"));
+
+  React.useEffect(() => {
+    const t = token.current;
+    modalStack.push(t);
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && modalStack[modalStack.length - 1] === t) {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("keydown", onEsc);
+      const i = modalStack.lastIndexOf(t);
+      if (i >= 0) modalStack.splice(i, 1);
+    };
+  }, [onClose]);
+
   return (
     <div
       className="overlay"
