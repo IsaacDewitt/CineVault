@@ -147,3 +147,26 @@ export interface ImportResult {
   imported_history: number;
   imported_folders: number;
 }
+
+// ============================================
+// 时长批量补全
+// ============================================
+export interface BackfillProgress {
+  done: number;
+  total: number;
+  filled: number;
+  failed: number;
+  current: string;
+}
+
+export interface BackfillResult {
+  total: number;
+  filled: number;
+  failed: number;
+  cancelled: boolean;
+}
+
+export interface FfprobeStatus {
+  available: boolean;
+  path: string | null;
+}

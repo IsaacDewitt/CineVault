@@ -129,7 +129,7 @@ export function VideoList({
             </div>
             <div className="v-meta">
               <TagChips tags={v.tags} />
-              <Stars rating={v.rating} />
+              <Stars rating={v.rating} compact />
               {v.is_favorite && <span style={{ color: "var(--accent)", fontSize: 13 }}>★</span>}
               {watched(v) && (
                 <span style={{ color: "var(--green)", fontSize: 11 }}>✓ 已看</span>

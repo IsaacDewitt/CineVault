@@ -158,9 +158,18 @@ export function KindBadge({ kind }: { kind: VideoKind }) {
   return <span className={`badge-kind ${kind}`}>{map[kind] ?? kind}</span>;
 }
 
-export function Stars({ rating }: { rating: number }) {
+export function Stars({ rating, compact = false }: { rating: number; compact?: boolean }) {
   const r = Math.round(rating);
   if (r <= 0) return <span className="stars" style={{ color: "var(--text-3)" }}>—</span>;
+  // compact 模式（列表用）：单星 + 数字，省 ~50px 宽度给标题
+  if (compact) {
+    return (
+      <span className="stars">
+        ★<span className="rating-num" style={{ marginLeft: 3 }}>{rating.toFixed(1)}</span>
+      </span>
+    );
+  }
+  // 完整模式（详情/卡片用）：保留 10 星直观显示
   return (
     <span className="stars">
       {"★".repeat(Math.max(1, Math.min(10, r)))}

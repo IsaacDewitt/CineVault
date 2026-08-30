@@ -1,43 +1,47 @@
 /* ============================================
-   CineVault 设计系统 - 深色主题
+   CineVault 设计系统 - 影院靛蓝（方案 B）
+   背景层次 1.42 · text-3 对比度 5.15:1 (AA)
+   语义：已完成=绿，进行中=琥珀，电影=蓝，剧集=绿(徽章)
    ============================================ */
 :root {
-  /* 背景层次 */
-  --bg-0: #0b0d13;
-  --bg-1: #10131c;
-  --bg-2: #151a26;
-  --bg-3: #1b2130;
-  --bg-hover: #1f2636;
+  /* 背景层次 — 亮度比 1.42，卡片明显浮起 */
+  --bg-0: #0a0f1a;
+  --bg-1: #111a2b;
+  --bg-2: #18233a;
+  --bg-3: #212e49;
+  --bg-hover: #273654;
 
-  /* 文字 */
-  --text-1: #e8ecf4;
-  --text-2: #9aa4b8;
-  --text-3: #5d6675;
+  /* 文字 — 三级全部过 AA 4.5:1 */
+  --text-1: #e6ecf7;
+  --text-2: #a3b3cd;
+  --text-3: #7d8cab;
 
-  /* 强调色 - 琥珀金 */
-  --accent: #e8b34b;
-  --accent-strong: #f5c96e;
-  --accent-dim: rgba(232, 179, 75, 0.14);
+  /* 强调色 - 暖金（对冷蓝背景反差更强） */
+  --accent: #f0b429;
+  --accent-strong: #ffc94d;
+  --accent-deep: #c98a1e;
+  --accent-ink: #1a1406;
+  --accent-dim: rgba(240, 180, 41, 0.15);
 
-  /* 语义色 */
-  --green: #34d399;
-  --blue: #6c8cff;
-  --red: #f87171;
+  /* 语义色 — 一色一义 */
+  --green: #34d399;   /* 已完成进度 + 剧集徽章 + ✓已看文字 */
+  --blue: #6c9bff;    /* 仅电影徽章 */
+  --red: #f87171;     /* 危险操作 */
   --purple: #a78bfa;
 
   /* 边框与阴影 */
-  --border: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.12);
-  --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.3);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.35);
 
   /* 圆角 */
   --r-lg: 14px;
   --r-md: 10px;
   --r-sm: 7px;
 
-  --font: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
-  --mono: "Cascadia Mono", Consolas, monospace;
+  --font: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
 }
 
 * {
@@ -57,8 +61,28 @@ body {
   background: var(--bg-0);
   color: var(--text-1);
   font-size: 14px;
+  line-height: 1.5;                      /* 全局行高基准 */
+  -webkit-font-smoothing: antialiased;   /* Windows/Edge 下文字更锐利 */
+  -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
   user-select: none;
+}
+
+/* 数字等宽：评分/集数/百分比/大小在列表里不再左右跳动 */
+.size,
+.rating-num,
+.nav-badge,
+.tag-count,
+.stats-bar b {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 文件路径、输入框、详情值允许复制（排查文件问题时用得上） */
+.input,
+.detail-row .val,
+.v-sub {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 ::-webkit-scrollbar {
@@ -131,11 +155,11 @@ select:focus-visible {
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  background: linear-gradient(135deg, var(--accent), #c98a1e);
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #1a1406;
+  color: var(--accent-ink);
   font-weight: 800;
   font-size: 15px;
 }
@@ -200,7 +224,7 @@ select:focus-visible {
 }
 .nav-item.active .nav-badge {
   color: var(--accent);
-  background: rgba(232, 179, 75, 0.12);
+  background: rgba(240, 180, 41, 0.12);
 }
 
 /* 标签区 */
@@ -234,6 +258,20 @@ select:focus-visible {
   margin-left: auto;
   font-size: 11px;
   color: var(--text-3);
+}
+/* 新建的标签闪一下，让"它确实出现了"这件事看得见 */
+@keyframes tag-flash {
+  0%,
+  55% {
+    background: var(--accent-dim);
+    color: var(--text-1);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.tag-item.just-created {
+  animation: tag-flash 1.8s ease-out;
 }
 .tag-add {
   display: flex;
@@ -270,7 +308,7 @@ select:focus-visible {
   gap: 12px;
   padding: 0 20px;
   border-bottom: 1px solid var(--border);
-  background: rgba(16, 19, 28, 0.8);
+  background: rgba(17, 26, 43, 0.8);        /* 跟随 --bg-1 #111a2b */
   backdrop-filter: blur(10px);
 }
 .search-box {
@@ -417,11 +455,16 @@ select:focus-visible {
   transition: background 0.12s, border-color 0.12s, transform 0.12s;
   position: relative;
   overflow: hidden;
+  /* B-6 渲染虚拟化（零依赖）：视口外的行跳过渲染与布局，"加载更多"滚到数百行
+     时滚动不再掉帧。contain-intrinsic-size 给未渲染行近似高度占位；
+     auto 关键字让浏览器记住渲染过的真实高度，滚动条不跳动。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 64px;
 }
 .video-row:hover {
   background: var(--bg-2);
   border-color: var(--border-strong);
-  transform: translateX(2px);
+  box-shadow: inset 3px 0 0 var(--accent);   /* 左侧强调竖条，不位移 */
 }
 /* 观看进度 = 整行背景淡色填充 */
 .v-progress-bg {
@@ -429,16 +472,16 @@ select:focus-visible {
   left: 0;
   top: 0;
   bottom: 0;
-  background: rgba(232, 179, 75, 0.10);
+  background: rgba(240, 180, 41, 0.10);      /* 进行中 = 琥珀 */
   z-index: 0;
   pointer-events: none;
   transition: width 0.25s ease;
 }
 .v-progress-bg.active {
-  background: linear-gradient(90deg, rgba(232, 179, 75, 0.20), rgba(232, 179, 75, 0.08));
+  background: linear-gradient(90deg, rgba(240, 180, 41, 0.22), rgba(240, 180, 41, 0.08));
 }
 .v-progress-bg.done {
-  background: rgba(108, 140, 255, 0.20);
+  background: rgba(52, 211, 153, 0.18);      /* 已完成 = 绿（原蓝，避免与电影徽章撞色） */
 }
 .video-row > *:not(.v-progress-bg) {
   position: relative;
@@ -481,7 +524,7 @@ select:focus-visible {
   flex-shrink: 0;
 }
 .badge-kind.movie {
-  background: rgba(108, 140, 255, 0.15);
+  background: rgba(108, 155, 255, 0.16);
   color: var(--blue);
 }
 .badge-kind.series {
@@ -489,7 +532,7 @@ select:focus-visible {
   color: var(--green);
 }
 .badge-kind.unknown {
-  background: rgba(232, 179, 75, 0.14);
+  background: rgba(240, 180, 41, 0.14);
   color: var(--accent);
 }
 
@@ -581,6 +624,9 @@ select:focus-visible {
   height: 100%;
   background: linear-gradient(90deg, var(--accent), var(--accent-strong));
   border-radius: 2px;
+}
+.series-card .s-bar-fill.done {
+  background: var(--green);    /* 已看完的剧集进度条 = 绿，与行内 .v-progress-bg.done 同口径 */
 }
 
 /* ============================================
@@ -713,7 +759,7 @@ select:focus-visible {
 }
 .btn-primary {
   background: var(--accent);
-  color: #1a1406;
+  color: var(--accent-ink);
 }
 .btn-primary:hover:not(:disabled) {
   filter: brightness(1.08);
@@ -830,7 +876,7 @@ select:focus-visible {
   height: 14px;
   border-radius: 50%;
   background: var(--accent);
-  border: 2px solid #1a1406;
+  border: 2px solid var(--accent-ink);
   box-shadow: 0 0 0 2px var(--accent-dim);
   cursor: grab;
 }

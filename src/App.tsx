@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import type {
+  BackfillProgress,
   HistoryEntry,
   SeriesOverview,
   Tag,
@@ -61,6 +63,8 @@ export default function App() {
   const [showPending, setShowPending] = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [detailVideo, setDetailVideo] = useState<VideoWithTags | null>(null);
+  // 非空即代表补全正在跑（按钮切换成进度条 + 中断）
+  const [backfill, setBackfill] = useState<BackfillProgress | null>(null);
 
   const debounceRef = useRef<number>(0);
 
@@ -89,22 +93,27 @@ export default function App() {
     }
   }, []);
 
+  // P-10：视频列表查询参数的唯一构造点，fetchVideos 与保分页刷新共用，防止两边漂移
+  const videoQuery = useCallback(
+    () => ({
+      pageSize: PAGE_SIZE,
+      query,
+      // "电影"视图强制类型=电影（顶栏联动 + 强制兜底）
+      kind: view === "movies" ? "movie" : kind,
+      tagIds: selectedTagIds,
+      favoritesOnly: view === "favorites",
+      minRating,
+      sort,
+      watchStatus,
+    }),
+    [query, kind, selectedTagIds, view, minRating, sort, watchStatus]
+  );
+
   const fetchVideos = useCallback(
     async (p = 0, append = false) => {
       setLoading(true);
       try {
-        const res = await api.getVideos({
-          page: p,
-          pageSize: PAGE_SIZE,
-          query,
-          // "电影"视图强制类型=电影（顶栏联动 + 强制兜底）
-          kind: view === "movies" ? "movie" : kind,
-          tagIds: selectedTagIds,
-          favoritesOnly: view === "favorites",
-          minRating,
-          sort,
-          watchStatus,
-        });
+        const res = await api.getVideos({ page: p, ...videoQuery() });
         setVideos((prev) => (append ? [...prev, ...res.items] : res.items));
         setTotal(res.total);
         setHasMore(res.has_more);
@@ -115,8 +124,34 @@ export default function App() {
         setLoading(false);
       }
     },
-    [query, kind, selectedTagIds, view, minRating, sort, watchStatus]
+    [videoQuery]
   );
+
+  // P-10：小改动（评分/收藏）后的"原位刷新"——把已加载的全部页重拉合并。
+  // 旧的 afterDataChange 一律 fetchVideos(0)，会把"加载更多"攒下的分页重置回第 0 页。
+  const refreshVideosKeepPage = useCallback(async () => {
+    setLoading(true);
+    try {
+      const merged: VideoWithTags[] = [];
+      let total = 0;
+      let hasMore = false;
+      for (let i = 0; i <= page; i++) {
+        const res = await api.getVideos({ page: i, ...videoQuery() });
+        merged.push(...res.items);
+        total = res.total;
+        hasMore = res.has_more;
+        if (!res.has_more) break;
+      }
+      setVideos(merged);
+      setTotal(total);
+      setHasMore(hasMore);
+      // page 不动：已加载页数不变
+    } catch (e) {
+      toast.err(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [page, videoQuery]);
 
   const fetchSeries = useCallback(async () => {
     try {
@@ -249,13 +284,19 @@ export default function App() {
     }
   }, [fetchVideos, fetchSeries, fetchTags, fetchStats, fetchPendingCount, syncPlayerProgress]);
 
-  const afterDataChange = useCallback(() => {
-    fetchVideos(0);
-    fetchSeries();
-    fetchTags();
-    fetchStats();
-    fetchPendingCount();
-  }, [fetchVideos, fetchSeries, fetchTags, fetchStats, fetchPendingCount]);
+  const afterDataChange = useCallback(
+    (opts?: { keepPage?: boolean }) => {
+      // P-10：keepPage（评分/收藏等小改动）走原位刷新保留分页；
+      // 默认（扫描/新增/导入，列表内容可能整体变化）重置回第 0 页。
+      if (opts?.keepPage) void refreshVideosKeepPage();
+      else void fetchVideos(0);
+      fetchSeries();
+      fetchTags();
+      fetchStats();
+      fetchPendingCount();
+    },
+    [fetchVideos, refreshVideosKeepPage, fetchSeries, fetchTags, fetchStats, fetchPendingCount]
+  );
 
   // ===== 播放 =====
   // 交给系统默认播放器（PotPlayer），续播由 PotPlayer 内置记忆位置负责
@@ -272,6 +313,36 @@ export default function App() {
       toast.err(String(e));
     }
   };
+
+  // ===== 时长批量补全 =====
+  // 背景：扫描流程从不写 duration，导致 PotPlayer 同步只能拿到"看到第几毫秒"却算不出百分比，
+  // 进度功能形同虚设。这里一次性把存量的片长补齐，进度百分比才能真正显示出来。
+  const doBackfill = useCallback(async () => {
+    setBackfill({ done: 0, total: 0, filled: 0, failed: 0, current: "正在统计…" });
+    // 必须先挂监听再发命令，否则开头几条进度事件会漏掉
+    const unlisten = await listen<BackfillProgress>("backfill-progress", (e) => {
+      setBackfill(e.payload);
+    });
+    try {
+      const r = await api.backfillDurations();
+      if (r.total === 0) {
+        toast.ok("所有视频都已有片长，无需补全");
+      } else if (r.cancelled) {
+        toast.ok(`已中断：成功 ${r.filled} · 失败 ${r.failed}（已完成的会保留）`);
+      } else {
+        toast.ok(`补全完成：成功 ${r.filled} · 失败 ${r.failed}`);
+      }
+      await afterDataChange();
+      // 时长补齐后再同步一次，让播放进度立刻按新时长算出来
+      await syncPlayerProgress(false);
+      await afterDataChange();
+    } catch (e) {
+      toast.err(String(e));
+    } finally {
+      unlisten();
+      setBackfill(null);
+    }
+  }, [afterDataChange, syncPlayerProgress]);
 
   // ===== 导出 / 导入 =====
   const doExport = async () => {
@@ -360,6 +431,10 @@ export default function App() {
         onOpenPending={() => setShowPending(true)}
         onExport={doExport}
         onImport={doImport}
+        onTagsChanged={fetchTags}
+        backfill={backfill}
+        onBackfill={doBackfill}
+        onCancelBackfill={() => void api.cancelDurationBackfill()}
       />
 
       <main className="main">
@@ -400,7 +475,7 @@ export default function App() {
               series={currentSeries}
               onBack={() => setCurrentSeriesId(null)}
               tags={tags}
-              onChanged={afterDataChange}
+              onChanged={() => afterDataChange({ keepPage: true })}
               onOpenVideo={(v) => setDetailVideo(v)}
               onPlayVideo={play}
             />
@@ -431,7 +506,7 @@ export default function App() {
                   videos={history.map((h) => h.video).filter(matchV)}
                   onOpen={setDetailVideo}
                   onPlay={play}
-                  onChanged={afterDataChange}
+                  onChanged={() => afterDataChange({ keepPage: true })}
                 />
               ) : (
                 <>
@@ -439,7 +514,7 @@ export default function App() {
                     videos={view === "recent" ? videos.filter(matchV) : videos}
                     onOpen={setDetailVideo}
                     onPlay={play}
-                    onChanged={afterDataChange}
+                    onChanged={() => afterDataChange({ keepPage: true })}
                   />
                   {/* 前端过滤时禁用"加载更多"（分页数据未过滤，避免错乱） */}
                   {hasMore && !q && (
@@ -489,7 +564,7 @@ export default function App() {
           video={detailVideo}
           tags={tags}
           onClose={() => setDetailVideo(null)}
-          onChanged={afterDataChange}
+          onChanged={() => afterDataChange({ keepPage: true })}
           onPlay={(v) => {
             play(v);
             setDetailVideo(null);

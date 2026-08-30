@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  BackfillProgress,
+  BackfillResult,
   ExportData,
+  FfprobeStatus,
   ImportResult,
   PaginatedVideos,
   PendingItem,
@@ -120,6 +123,14 @@ export const api = {
   writeTextFile: (filePath: string, content: string) =>
     invoke("write_text_file", { filePath, content }),
 
+  // 时长补全
+  backfillDurations: () => invoke<BackfillResult>("backfill_durations"),
+  cancelDurationBackfill: () => invoke("cancel_duration_backfill"),
+  getFfprobeStatus: () => invoke<FfprobeStatus>("get_ffprobe_status"),
+
   // 系统
   getDrives: () => invoke<{ letter: string; path: string; label: string }[]>("get_drives"),
 };
+
+// 事件负载类型（backfill-progress）仅此一处引用，单独导出避免被当未使用
+export type { BackfillProgress };

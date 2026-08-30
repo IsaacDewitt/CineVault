@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import type { Tag, ViewKey } from "../types";
+import React, { useEffect, useRef, useState } from "react";
+import type { BackfillProgress, Tag, ViewKey } from "../types";
 import { api } from "../api";
 import { toast } from "./ui";
 
@@ -35,6 +35,10 @@ export function Sidebar({
   onOpenPending,
   onExport,
   onImport,
+  onTagsChanged,
+  backfill,
+  onBackfill,
+  onCancelBackfill,
 }: {
   view: ViewKey;
   onView: (v: ViewKey) => void;
@@ -49,9 +53,35 @@ export function Sidebar({
   onOpenPending: () => void;
   onExport: () => void;
   onImport: () => void;
+  onTagsChanged: () => void | Promise<void>;
+  backfill: BackfillProgress | null;
+  onBackfill: () => void;
+  onCancelBackfill: () => void;
 }) {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
+  const [ffprobe, setFfprobe] = useState<boolean | null>(null);
+  const [justCreatedId, setJustCreatedId] = useState<number | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // 新标签按 sort_order/name 排序后可能落在列表可视区之外，
+  // 滚过去并闪一下——否则用户会以为"新建"没生效（它其实建成了，只是没被看到）。
+  useEffect(() => {
+    if (justCreatedId === null) return;
+    document
+      .querySelector(`[data-tag-id="${justCreatedId}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+    const timer = window.setTimeout(() => setJustCreatedId(null), 1800);
+    return () => window.clearTimeout(timer);
+  }, [justCreatedId, tags]);
+
+  // ffprobe 是否可用决定 rmvb/flv/avi/ts 等非主流格式能不能补出时长
+  useEffect(() => {
+    api
+      .getFfprobeStatus()
+      .then((s) => setFfprobe(s.available))
+      .catch(() => setFfprobe(false));
+  }, []);
 
   const items: { key: ViewKey; label: string; icon: string; badge?: number }[] = [
     { key: "all", label: "全部视频", icon: "all", badge: counts.all },
@@ -64,12 +94,19 @@ export function Sidebar({
 
   const submitTag = async () => {
     const n = name.trim();
-    if (!n) return;
+    if (!n) {
+      setAdding(false);
+      return;
+    }
+    const dup = tags.some((t) => t.name.trim().toLowerCase() === n.toLowerCase());
     try {
-      await api.createTag(n, "#e8b34b");
+      const created = await api.createTag(n, "#e8b34b");
+      setJustCreatedId(created.id);
       setName("");
       setAdding(false);
-      toast.ok("标签已创建");
+      // 关键：不刷新父级 tags 的话，标签进了库却不在侧栏出现，看起来就是"新建无效"
+      await onTagsChanged();
+      toast.ok(dup ? `标签「${n}」已存在` : `标签「${n}」已创建`);
     } catch (e) {
       toast.err(String(e));
     }
@@ -115,7 +152,10 @@ export function Sidebar({
         {tags.map((t) => (
           <div
             key={t.id}
-            className={`tag-item${selectedTagIds.includes(t.id) ? " selected" : ""}`}
+            data-tag-id={t.id}
+            className={`tag-item${selectedTagIds.includes(t.id) ? " selected" : ""}${
+              justCreatedId === t.id ? " just-created" : ""
+            }`}
             onClick={() => onToggleTag(t.id)}
           >
             <span className="tag-dot" style={{ background: t.color }} />
@@ -127,18 +167,41 @@ export function Sidebar({
         ))}
 
         {adding ? (
-          <div style={{ padding: "4px 8px" }}>
+          <div style={{ padding: "4px 8px", display: "flex", gap: 6 }}>
             <input
+              ref={inputRef}
               className="input"
               autoFocus
               placeholder="标签名"
               value={name}
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") submitTag();
-                if (e.key === "Escape") setAdding(false);
+                if (e.key === "Enter") void submitTag();
+                if (e.key === "Escape") {
+                  setName("");
+                  setAdding(false);
+                }
               }}
             />
+            <button
+              className="btn btn-primary"
+              style={{ padding: "0 10px", fontSize: 13 }}
+              onClick={() => void submitTag()}
+              title="创建（回车）"
+            >
+              ✓
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ padding: "0 10px", fontSize: 13 }}
+              onClick={() => {
+                setName("");
+                setAdding(false);
+              }}
+              title="取消（Esc）"
+            >
+              ✕
+            </button>
           </div>
         ) : (
           <button className="tag-add" onClick={() => setAdding(true)}>
@@ -170,6 +233,43 @@ export function Sidebar({
         <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onImport} title="从 JSON 导入数据">
           ⬆ 导入
         </button>
+      </div>
+
+      <div style={{ padding: "0 10px 10px" }}>
+        {backfill ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            <div className="s-bar">
+              <div
+                className="s-bar-fill"
+                style={{
+                  width: `${backfill.total > 0 ? Math.round((backfill.done / backfill.total) * 100) : 0}%`,
+                }}
+              />
+            </div>
+            <div className="v-sub" title={backfill.current}>
+              {backfill.total > 0
+                ? `${backfill.done}/${backfill.total} · 成功 ${backfill.filled}`
+                : "正在统计…"}
+            </div>
+            <button className="btn btn-ghost" style={{ fontSize: 11 }} onClick={onCancelBackfill}>
+              中断补全
+            </button>
+          </div>
+        ) : (
+          <button
+            className="btn btn-ghost"
+            style={{ width: "100%" }}
+            onClick={onBackfill}
+            title={
+              ffprobe === false
+                ? "未检测到 ffprobe：mp4/mkv 仍可补全，rmvb/flv/avi/ts 等格式会跳过"
+                : "为所有缺片长的视频补上时长，让播放进度百分比能算出来"
+            }
+          >
+            ⏱ 补全片长
+            {ffprobe === false && <span style={{ color: "var(--text-3)" }}>（无 ffprobe）</span>}
+          </button>
+        )}
       </div>
     </aside>
   );

@@ -139,7 +139,10 @@ export function SeriesGrid({
                 <TagChips tags={s.tags} />
               </div>
               <div className="s-bar">
-                <div className="s-bar-fill" style={{ width: `${pct}%` }} />
+                <div
+                  className={`s-bar-fill${pct >= 100 ? " done" : ""}`}
+                  style={{ width: `${pct}%` }}
+                />
               </div>
             </div>
           );
