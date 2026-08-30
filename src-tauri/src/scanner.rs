@@ -38,6 +38,7 @@ pub struct VideoInfo {
     pub file_path: String,
     pub file_name: String,
     pub file_size: i64,
+    pub duration: Option<f64>,
     pub kind: String,
     pub confidence: i32,
     pub series_name: Option<String>,
@@ -100,11 +101,17 @@ pub fn extract_video_info(path: &Path, sibling_map: &HashMap<PathBuf, Vec<String
 
     let c: Classification = classifier::classify(&title, &parent_name, grandparent_name.as_deref(), &siblings);
 
+    // 时长：只走自研容器解析（mp4/mkv，读文件头，零子进程）。
+    // 扫描动辄几千个文件，这里若启 ffprobe（每文件一个进程，50~100ms）会把扫描从几十秒拖到近十分钟。
+    // 非主流格式（rmvb/flv/avi/ts）留到"补全片长"或同步时按需用 ffprobe 补，扫描速度优先。
+    let duration = crate::media_info::probe_duration_sec(path, false);
+
     VideoInfo {
         title,
         file_path,
         file_name,
         file_size,
+        duration,
         kind: c.kind,
         confidence: c.confidence,
         series_name: c.series_name,

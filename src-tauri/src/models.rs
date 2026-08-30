@@ -254,3 +254,30 @@ pub struct ImportResult {
     pub imported_history: i64,
     pub imported_folders: i64,
 }
+
+// ============================================================
+// 时长批量补全
+// ============================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillProgress {
+    pub done: i64,
+    pub total: i64,
+    pub filled: i64,
+    pub failed: i64,
+    /// 刚处理完的文件路径（界面上滚动显示，让用户知道还在动）
+    pub current: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillResult {
+    pub total: i64,
+    pub filled: i64,
+    pub failed: i64,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FfprobeStatus {
+    pub available: bool,
+    pub path: Option<String>,
+}

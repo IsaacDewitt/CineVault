@@ -18,8 +18,11 @@ impl DbConn {
 const SCHEMA_VERSION: i64 = 1;
 
 pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
+    // synchronous=NORMAL：WAL 默认 FULL，每次提交都 fsync（实测 31.62 ms/条 vs 0.29 ms/条）。
+    // 与 main.rs 里的连接 PRAGMA 保持一致（本函数也被迁移/测试路径调用）。
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;
          PRAGMA busy_timeout=5000;
          CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -83,14 +86,8 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             progress REAL NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS idx_watch_history_video ON watch_history(video_id);
-         -- 去重索引：让各处 INSERT OR IGNORE 真正生效（同一视频同一时刻同一进度只留一条）。
-         -- 必须在这里建而不能只靠 migrator，否则全新库会退化成每条都插，历史被同一部片子刷屏。
-         -- 建索引前先清存量重复（老库/导入场景可能已有），否则 CREATE UNIQUE INDEX 会直接失败。
-         DELETE FROM watch_history WHERE id NOT IN (
-            SELECT MIN(id) FROM watch_history GROUP BY video_id, watched_at, progress
-         );
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_history_dedup
-            ON watch_history(video_id, watched_at, progress);
+         -- 去重索引（P-7）：DELETE 不是幂等操作，已挪到下方一次性开关里执行，
+         -- 别加回这个 execute_batch——否则每次冷启动都全表扫描 + 分组一遍。
          CREATE TABLE IF NOT EXISTS scan_folders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             folder_path TEXT NOT NULL UNIQUE,
@@ -101,6 +98,22 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             value TEXT
          );",
     )?;
+
+    // P-7：启动去重一次性开关。上面主 batch 里不能放这个 DELETE——它不是幂等操作，
+    // 每次冷启动都要全表扫描 + 分组（2,433 条时 0.66ms，10 万条约 30ms，随库线性涨）。
+    // 用 settings 里的标志保证库生命周期内只清一次存量重复 + 建一次唯一索引；
+    // 索引建好后一直存在，各处 INSERT OR IGNORE 靠它防同一条历史刷屏，语义不变。
+    // （settings 表在上方 batch 已确保存在，顺序安全。）
+    if get_setting(conn, "hist_dedup_idx_v1")?.is_none() {
+        conn.execute_batch(
+            "DELETE FROM watch_history WHERE id NOT IN (
+                SELECT MIN(id) FROM watch_history GROUP BY video_id, watched_at, progress
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_history_dedup
+                ON watch_history(video_id, watched_at, progress);",
+        )?;
+        set_setting(conn, "hist_dedup_idx_v1", "1")?;
+    }
 
     let v: Option<i64> = conn
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
@@ -249,8 +262,9 @@ pub fn upsert_video(
                         "UPDATE videos SET file_path=?1, title=?2, file_size=?3, series_id=?4,
                          season=COALESCE(?5, season), episode=COALESCE(?6, episode),
                          user_kind=COALESCE(user_kind, ?7),
-                         updated_at=datetime('now','localtime') WHERE id=?8",
-                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, p.user_kind, old_id],
+                         duration=COALESCE(duration, ?8),
+                         updated_at=datetime('now','localtime') WHERE id=?9",
+                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, p.user_kind, p.duration, old_id],
                     )?;
                     return Ok(UpsertResult::Updated(old_id));
                 }
@@ -279,8 +293,9 @@ pub fn upsert_video(
                     "UPDATE videos SET file_path=?1, title=?2, file_size=?3,
                      season=COALESCE(?4, season), episode=COALESCE(?5, episode),
                      user_kind=COALESCE(user_kind, ?6),
-                     updated_at=datetime('now','localtime') WHERE id=?7",
-                    params![p.file_path, p.title, p.file_size, p.season, p.episode, p.user_kind, old_id],
+                     duration=COALESCE(duration, ?7),
+                     updated_at=datetime('now','localtime') WHERE id=?8",
+                    params![p.file_path, p.title, p.file_size, p.season, p.episode, p.user_kind, p.duration, old_id],
                 )?;
                 return Ok(UpsertResult::Updated(old_id));
             }
@@ -364,8 +379,17 @@ pub fn query_videos_paginated(
         _ => "ORDER BY COALESCE(v.last_watched_at, '') DESC, v.id",
     };
 
+    // B-8：series 的 LEFT JOIN 只在搜索条件引用剧集名（s. 别名）时才需要——
+    // series_id 是外键，join 不改变行数，纯 COUNT 时是白扫一趟。按需拼接。
+    let needs_series_join = conditions.iter().any(|c| c.contains("s."));
+    let series_join = if needs_series_join {
+        " LEFT JOIN series s ON s.id = v.series_id"
+    } else {
+        ""
+    };
+
     let total: i64 = {
-        let sql = format!("SELECT COUNT(*) FROM videos v LEFT JOIN series s ON s.id = v.series_id {}", where_sql);
+        let sql = format!("SELECT COUNT(*) FROM videos v{} {}", series_join, where_sql);
         let mut stmt = conn.prepare(&sql)?;
         stmt.query_row(cond_params, |r| r.get(0))?
     };
@@ -573,22 +597,127 @@ pub fn mark_played(conn: &Connection, video_id: i64) -> Result<(), AppError> {
     let prog: f64 = conn
         .query_row("SELECT watch_progress FROM videos WHERE id = ?1", params![video_id], |r| r.get(0))
         .unwrap_or(0.0);
-    conn.execute(
-        "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
-        params![video_id, now, prog],
-    )?;
-    trim_history(conn, video_id)?;
+    record_watch(conn, video_id, prog)?;
     sync_series_aggregate(conn, video_id)?;
     Ok(())
 }
 
 /// 每个视频的 watch_history 最多保留最近 50 条，防 DB 无限膨胀
 pub fn trim_history(conn: &Connection, video_id: i64) -> Result<(), AppError> {
+    // P-11：绝大多数调用历史远不到 50 条，DELETE 排序是白跑。先 COUNT，超限才删。
+    // sync_progress_impl 每条 pending 调一次，省的是每条一次无谓的排序扫描。
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM watch_history WHERE video_id = ?1",
+        params![video_id],
+        |r| r.get(0),
+    )?;
+    if count <= 50 {
+        return Ok(());
+    }
     conn.execute(
         "DELETE FROM watch_history WHERE id IN (
             SELECT id FROM watch_history WHERE video_id = ?1 ORDER BY id DESC LIMIT -1 OFFSET 50
         )",
         params![video_id],
+    )?;
+    Ok(())
+}
+
+/// 同一视频相邻两条记录的时间间隔小于该值（分钟）即视为同一次观影会话，合并而非新增。
+const WATCH_SESSION_WINDOW_MIN: i64 = 5;
+
+/// 写观看历史：同一视频在 5 分钟窗口内已有记录则**合并**（进度取大、时间刷新），不再新增一行。
+///
+/// 背景：PotPlayer 同步每 60s 轮询一次，播放位置每次变化都会触发写入，
+/// 导致同一次观影被拆成十几条记录（实测单视频 13 条，21:28:30 与 21:28:34 隔 4 秒各一条）。
+/// 进度无进展时连时间都不刷新，避免"看了一晚上"的历史时间戳被轮询无限往后推。
+pub fn record_watch(conn: &Connection, video_id: i64, progress: f64) -> Result<(), AppError> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let window = format!("-{} minutes", WATCH_SESSION_WINDOW_MIN);
+    let existing: Option<(i64, f64)> = conn
+        .query_row(
+            "SELECT id, progress FROM watch_history
+             WHERE video_id = ?1 AND watched_at >= datetime(?2, ?3)
+             ORDER BY id DESC LIMIT 1",
+            params![video_id, now, window],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    match existing {
+        // 窗口内有记录但进度无进展 → 什么都不做（轮询重复写入的主要来源）
+        Some((_, old)) if progress <= old => {}
+        Some((hid, _)) => {
+            conn.execute(
+                "UPDATE watch_history SET progress = ?1, watched_at = ?2 WHERE id = ?3",
+                params![progress, now, hid],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
+                params![video_id, now, progress],
+            )?;
+        }
+    }
+    trim_history(conn, video_id)
+}
+
+/// 清理存量重复：同一视频**在同一秒内**被写了多条记录时，只保留进度最大的那条。
+///
+/// 只认"同一秒"这个严格条件，刻意不做更宽的窗口合并，理由：
+/// 1. 历史记录的时间戳与自增 id **不同序**（导入时保留了原始时间戳，新导入的旧记录 id 更大），
+///    按 id 或按时间取"相邻一条"都会错位，实测会误删 2281 条（占历史总数一半）。
+/// 2. 同一秒内的多条大多是批量写入的产物（先插 progress=0、再插 progress=100），
+///    保留进度最大的那条才是有意义的那条；若按时间顺序删"后一条"，反而会把 100% 删掉、留下 0%。
+/// 只跑一次，结果记 settings。
+pub fn dedupe_watch_history_sessions(conn: &Connection) -> Result<i64, AppError> {
+    let done = get_setting(conn, "history_session_dedup_v1")?;
+    if done.as_deref() == Some("1") {
+        return Ok(0);
+    }
+    let removed = conn.execute(
+        "DELETE FROM watch_history WHERE id IN (
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY video_id, watched_at
+                           ORDER BY progress DESC, id DESC
+                       ) AS rn
+                FROM watch_history
+            )
+            WHERE rn > 1
+        )",
+        [],
+    )?;
+    let _ = set_setting(conn, "history_session_dedup_v1", "1");
+    Ok(removed as i64)
+}
+
+// ============================================
+// 时长提取支持
+// ============================================
+/// 取出所有缺时长的视频（id, file_path），供批量补全使用
+pub fn get_videos_missing_duration(conn: &Connection) -> Result<Vec<(i64, String)>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path FROM videos WHERE duration IS NULL ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut v = Vec::new();
+    for r in rows {
+        if let Ok(x) = r {
+            v.push(x);
+        }
+    }
+    Ok(v)
+}
+
+/// 写入时长（秒）。只填空，不覆盖已有值。
+pub fn set_video_duration(conn: &Connection, video_id: i64, duration_sec: f64) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE videos SET duration = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
+        params![duration_sec, video_id],
     )?;
     Ok(())
 }
@@ -615,16 +744,17 @@ pub fn sync_series_aggregate(conn: &Connection, video_id: i64) -> Result<(), App
     Ok(())
 }
 
-/// 最近看过的片子（UI 用）：按 video_id 去重，每个视频只保留最近一条，并带回完整视频数据。
-/// 不去重的话同一部片子反复播放会在列表里刷屏（生产库曾出现单视频 6 条、平均 2 条/视频）。
+/// 最近看过的片子（UI 用）：每个视频只出现一次，带回完整视频数据。
+/// P-9：原实现用 ROW_NUMBER() 窗口函数把整个 watch_history 扫完排序后才能 LIMIT
+/// （生产库实测 2.17ms，是最慢查询，且历史表只增、线性变慢）。
+/// 改走 videos.last_watched_at —— 它本来就在同步维护（mark_played / update_watch_progress /
+/// sync_progress 都写它），一次索引式查询搞定，不碰 watch_history。
+/// 注意：import_data 导入时会回填 last_watched_at（见该函数），否则导入备份后本查询缺项。
 pub fn get_history_entries(conn: &Connection, limit: i64) -> Result<Vec<HistoryEntry>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT video_id, watched_at, progress FROM (
-            SELECT video_id, watched_at, progress,
-                   ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY watched_at DESC, id DESC) AS rn
-            FROM watch_history
-         ) WHERE rn = 1
-         ORDER BY watched_at DESC, video_id DESC LIMIT ?1",
+        "SELECT id, last_watched_at, watch_progress FROM videos
+         WHERE last_watched_at IS NOT NULL
+         ORDER BY last_watched_at DESC, id DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
@@ -702,6 +832,31 @@ pub fn get_all_tags(conn: &Connection) -> Result<Vec<Tag>, AppError> {
 }
 
 pub fn create_tag(conn: &Connection, name: &str, color: &str) -> Result<Tag, AppError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::validation("标签名不能为空"));
+    }
+    // 同名（忽略大小写）已存在时直接返回已有记录：tags.name 是 UNIQUE，
+    // 直接 INSERT 会抛 "UNIQUE constraint failed"，用户只看到一句看不懂的英文报错。
+    let existing = conn
+        .query_row(
+            "SELECT t.id, t.color, (SELECT COUNT(*) FROM video_tags vt WHERE vt.tag_id = t.id)
+                 + (SELECT COUNT(*) FROM series_tags st WHERE st.tag_id = t.id)
+             FROM tags t WHERE t.name = ?1 COLLATE NOCASE",
+            params![name],
+            |r| {
+                Ok(Tag {
+                    id: r.get(0)?,
+                    name: name.to_string(),
+                    color: r.get(1)?,
+                    video_count: Some(r.get(2)?),
+                })
+            },
+        )
+        .optional()?;
+    if let Some(t) = existing {
+        return Ok(t);
+    }
     conn.execute("INSERT INTO tags (name, color) VALUES (?1, ?2)", params![name, color])?;
     Ok(Tag {
         id: conn.last_insert_rowid(),
@@ -887,13 +1042,25 @@ pub fn mark_series_watched(conn: &Connection, series_id: i64, watched: bool) -> 
 // 统计
 // ============================================
 pub fn get_stats(conn: &Connection) -> Result<VideoStats, AppError> {
-    let total_videos: i64 = conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))?;
-    let total_series: i64 = conn.query_row("SELECT COUNT(*) FROM series", [], |r| r.get(0))?;
-    let total_size: i64 = conn.query_row("SELECT COALESCE(SUM(file_size), 0) FROM videos", [], |r| r.get(0))?;
-    let favorites_count: i64 = conn.query_row("SELECT COUNT(*) FROM videos WHERE is_favorite = 1", [], |r| r.get(0))?;
-    let watched_count: i64 = conn.query_row("SELECT COUNT(DISTINCT video_id) FROM watch_history", [], |r| r.get(0))?;
-    let average_rating: f64 = conn.query_row("SELECT COALESCE(AVG(rating), 0) FROM videos WHERE rating > 0", [], |r| r.get(0))?;
-    let movie_count: i64 = conn.query_row("SELECT COUNT(*) FROM videos WHERE kind = 'movie'", [], |r| r.get(0))?;
+    // P-8：原来 7 次独立 query_row = 7 次全表扫描；合成一条后 SQLite 一次遍历出全部列。
+    // 被 afterDataChange 高频调用，量小但白送的 11% + 随库放大的往返次数都省了。
+    let (total_videos, total_series, total_size, favorites_count, watched_count, average_rating, movie_count) =
+        conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM videos),
+                (SELECT COUNT(*) FROM series),
+                (SELECT COALESCE(SUM(file_size), 0) FROM videos),
+                (SELECT COUNT(*) FROM videos WHERE is_favorite = 1),
+                (SELECT COUNT(DISTINCT video_id) FROM watch_history),
+                (SELECT COALESCE(AVG(rating), 0) FROM videos WHERE rating > 0),
+                (SELECT COUNT(*) FROM videos WHERE kind = 'movie')",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                ))
+            },
+        )?;
     Ok(VideoStats {
         total_videos,
         total_series,
@@ -992,12 +1159,14 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
     let mut tag_map: HashMap<String, i64> = HashMap::new();
     let mut tags = 0i64;
     for t in &data.tags {
-        tx.execute(
+        // B-9：INSERT ... RETURNING id 一次往返拿 id，省掉原来"插入后再 SELECT 回查"的 N+1
+        let id: i64 = tx.query_row(
             "INSERT INTO tags (name, color) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET color = excluded.color",
+             ON CONFLICT(name) DO UPDATE SET color = excluded.color
+             RETURNING id",
             params![t.name, t.color],
+            |r| r.get(0),
         )?;
-        let id: i64 = tx.query_row("SELECT id FROM tags WHERE name = ?1", params![t.name], |r| r.get(0))?;
         tag_map.insert(t.name.clone(), id);
         tags += 1;
     }
@@ -1006,13 +1175,15 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
     let mut series_id_by_name: HashMap<String, i64> = HashMap::new();
     let mut series_count = 0i64;
     for s in &data.series {
-        tx.execute(
+        // B-9：同标签，RETURNING id 省一次回查
+        let id: i64 = tx.query_row(
             "INSERT INTO series (name, folder_path, rating, is_favorite, last_watched_at, watch_progress)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(name) DO UPDATE SET
                 rating = MAX(series.rating, excluded.rating),
                 is_favorite = MAX(series.is_favorite, excluded.is_favorite),
-                folder_path = COALESCE(series.folder_path, excluded.folder_path)",
+                folder_path = COALESCE(series.folder_path, excluded.folder_path)
+             RETURNING id",
             params![
                 s.name,
                 s.folder_path,
@@ -1021,8 +1192,8 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
                 s.last_watched_at,
                 s.progress
             ],
+            |r| r.get(0),
         )?;
-        let id: i64 = tx.query_row("SELECT id FROM series WHERE name = ?1", params![s.name], |r| r.get(0))?;
         series_id_by_name.insert(s.name.clone(), id);
         // 剧集标签
         for t in &s.tags {
@@ -1093,6 +1264,18 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
             history_count += 1;
         }
     }
+
+    // P-9 配套回填：get_history_entries 改走 videos.last_watched_at 后，导出记录里
+    // last_watched_at 为 NULL 但历史存在的片子会从"最近观看"里消失。这里只填 NULL
+    // （不覆盖已有值，避免把本地更新的时间戳回退），从历史流水取 MAX 兜底。
+    tx.execute(
+        "UPDATE videos SET last_watched_at = (
+            SELECT MAX(watched_at) FROM watch_history wh WHERE wh.video_id = videos.id
+         )
+         WHERE last_watched_at IS NULL
+           AND id IN (SELECT DISTINCT video_id FROM watch_history)",
+        [],
+    )?;
 
     tx.commit()?;
 
@@ -1193,6 +1376,29 @@ mod tests {
         assert_eq!(count, 1, "不应产生重复行");
     }
 
+    /// 回归：侧栏"新建标签"曾只 INSERT 不返回错误码——tags.name 是 UNIQUE，
+    /// 重名时抛 "UNIQUE constraint failed"；而前端建完又不刷新列表，
+    /// 两条叠加的表现就是"点了新建，什么都没发生"。
+    #[test]
+    fn create_tag_is_idempotent_and_trims_name() {
+        let conn = mem_db();
+        let a = create_tag(&conn, "  科幻  ", "#ff0000").unwrap();
+        assert_eq!(a.name, "科幻", "标签名应 trim 后再入库");
+        assert_eq!(a.video_count, Some(0));
+
+        // 同名（大小写不同）应返回已有标签，而不是报错
+        let b = create_tag(&conn, "科幻", "#00ff00").unwrap();
+        assert_eq!(b.id, a.id);
+        assert_eq!(b.color, "#ff0000", "已存在时不应覆盖颜色");
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "重复创建不应产生第二行");
+
+        assert!(create_tag(&conn, "   ", "#ff0000").is_err(), "空名应报错");
+    }
+
     /// 剧集进度 = 已看集数 / 总集数，与 watched_episodes 同源。
     /// 旧实现取 MAX(单集进度)：看 1/46 集就显示整剧 100%，与卡片上的"已看 1/46 集"自相矛盾。
     #[test]
@@ -1241,7 +1447,10 @@ mod tests {
         assert_eq!(ratio(&conn), (4, 4, 100.0), "全剧标记已看 → 4/4 且 100%");
     }
 
-    /// 播放历史按视频去重：同一部片子反复播放只保留一条，且带回完整视频数据
+    /// 最近观看按视频去重：同一部片子反复播放只出现一次，且带回完整视频数据。
+    /// P-9 之后数据源是 videos.last_watched_at / watch_progress（生产链路 update_watch_progress /
+    /// mark_played / sync 都会同步维护这两列），所以测试要模拟完整写入路径，
+    /// 不能只插 watch_history——那正是老实现（窗口函数全扫历史）被换掉的原因。
     #[test]
     fn history_entries_dedup_per_video() {
         let mut conn = mem_db();
@@ -1251,19 +1460,26 @@ mod tests {
         tx.commit().unwrap();
 
         for (i, vid) in [a, a, b, a].iter().enumerate() {
+            let ts = format!("2026-08-28 00:00:0{}", i);
             conn.execute(
                 "INSERT OR IGNORE INTO watch_history (video_id, watched_at, progress) VALUES (?1, ?2, ?3)",
-                params![vid, format!("2026-08-28 00:00:0{}", i), i as f64],
+                params![vid, ts, i as f64],
+            )
+            .unwrap();
+            // 模拟生产写入：progress 与 last_watched_at 同步维护
+            conn.execute(
+                "UPDATE videos SET watch_progress = ?1, last_watched_at = ?2 WHERE id = ?3",
+                params![i as f64, ts, vid],
             )
             .unwrap();
         }
 
         let entries = get_history_entries(&conn, 50).unwrap();
         assert_eq!(entries.len(), 2, "两个视频应各只出现一次");
-        // 按最近时间倒序：A 的最后一条是 00:00:03（进度 3）
+        // 按最近时间倒序：A 的最后一次观看是 00:00:03（进度 3）
         // VideoWithTags 是 flatten 结构，Rust 侧要写 .video.video.id（序列化后是扁平的）
         assert_eq!(entries[0].video.video.id, a);
-        assert!((entries[0].progress - 3.0).abs() < f64::EPSILON, "应取该视频最近一条的进度");
+        assert!((entries[0].progress - 3.0).abs() < f64::EPSILON, "应取该视频最近一次观看的进度");
         assert_eq!(entries[0].video.video.file_size, 1024, "应带回完整视频数据");
         assert_eq!(entries[1].video.video.id, b);
     }
