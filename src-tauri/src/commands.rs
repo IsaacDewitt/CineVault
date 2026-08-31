@@ -751,12 +751,15 @@ fn shell_open(file: &Path, directory: Option<&Path>) -> Result<(), String> {
     // 这一次 %CINEVAULT_OPEN_TARGET% 上，展开结果不会被二次解析，路径原样到达 start。
     // 与 open crate 用 $env:OPEN_RS_TARGET 的思路一致。单次 .arg() 而非 .args([...]) 数组：
     // 数组里 &str 和 &OsStr 混着塞会触发类型不匹配。
+    // 必须用 .raw_arg() 加空格 + 引号：.arg() 遇到无空格的 "%CINEVAULT_OPEN_TARGET%"
+    // 不会自动加引号，env 展开后路径里的空格会把 start 当多参数解析，导致
+    // "H:\...\Arcane S02E05..." 被截断成 "H:\...\Arcane"（实测 2026-08-30）。
     let status = Command::new("cmd")
         .env("CINEVAULT_OPEN_TARGET", file.as_os_str())
         .arg("/c")
         .arg("start")
         .arg("")
-        .arg("%CINEVAULT_OPEN_TARGET%")
+        .raw_arg(" \"%CINEVAULT_OPEN_TARGET%\"")
         .current_dir(cwd)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
