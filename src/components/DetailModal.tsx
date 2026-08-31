@@ -207,7 +207,11 @@ export function DetailModal({
             onPlay(video);
           }}
         >
-          ▶ 播放
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "-2px", marginRight: 6 }}>
+            <circle cx="12" cy="12" r="8.8" />
+            <path d="M10.4 8.6l5 3.4-5 3.4z" />
+          </svg>
+          播放
         </button>
         <button
           className="btn btn-ghost"

@@ -3,20 +3,51 @@ import type { BackfillProgress, Tag, ViewKey } from "../types";
 import { api } from "../api";
 import { toast } from "./ui";
 
-const ICONS: Record<string, string> = {
-  all: "M4 6h16M4 12h16M4 18h10",
-  movies: "M3 5l9-3 9 3v14l-9 3-9-3V5zm9-3v14m6-9.5L6 7",
-  series: "M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12.5v-9l6 4.5-6 4.5z",
-  favorites: "M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z",
-  recent: "M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10h-4v4h-2v-4H7v-2h4V7h2v4h4v2z",
-  history: "M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z",
-  pending: "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z",
+// 导航图标：统一 24 网格 / 1.7 圆头描边（与「片库网格」图标体系同源）
+const ICONS: Record<string, React.ReactNode> = {
+  all: <path d="M4 6h16M4 12h16M4 18h10" />,
+  movies: (
+    <>
+      <rect x="3" y="4.5" width="18" height="15" rx="2.6" />
+      <path d="M8 4.5v15M16 4.5v15" />
+    </>
+  ),
+  series: (
+    <>
+      <rect x="2.6" y="4.5" width="18.8" height="12.6" rx="2.6" />
+      <path d="M8.4 20.5h7.2M12 17.1v3.4" />
+      <path d="M10.6 8.1l4.3 2.7-4.3 2.7z" />
+    </>
+  ),
+  favorites: (
+    <path d="M12 20.4c0 0-7.6-4.8-7.6-10A4.7 4.7 0 0 1 12 7.6a4.7 4.7 0 0 1 7.6 2.8c0 5.2-7.6 10-7.6 10z" />
+  ),
+  recent: (
+    <>
+      <circle cx="12" cy="12" r="8.8" />
+      <path d="M12 6.9V12l3.3 2.1" />
+    </>
+  ),
+  history: (
+    <>
+      <path d="M3 3v5h5" />
+      <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8" />
+      <path d="M12 7v5l4 2" />
+    </>
+  ),
+  pending: (
+    <>
+      <circle cx="12" cy="12" r="8.8" />
+      <path d="M12 7.6v5.2" />
+      <path d="M12 16.4h.01" />
+    </>
+  ),
 };
 
-function NavIcon({ path }: { path: string }) {
+function NavIcon({ children }: { children: React.ReactNode }) {
   return (
-    <svg className="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d={path} />
+    <svg className="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      {children}
     </svg>
   );
 }
@@ -115,7 +146,16 @@ export function Sidebar({
   return (
     <aside className="sidebar">
       <div className="logo">
-        <div className="logo-mark">CV</div>
+        <div className="logo-mark" aria-hidden>
+          {/* 应用图标「片库网格」迷你版：四格 + 右下播放键 */}
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none">
+            <rect x="5.44" y="5.44" width="6.19" height="6.19" rx="1.56" fill="#fff" fillOpacity="0.95" />
+            <rect x="12.38" y="5.44" width="6.19" height="6.19" rx="1.56" fill="#fff" fillOpacity="0.5" />
+            <rect x="5.44" y="12.38" width="6.19" height="6.19" rx="1.56" fill="#fff" fillOpacity="0.5" />
+            <rect x="12.38" y="12.38" width="6.19" height="6.19" rx="1.56" fill="#fff" fillOpacity="0.95" />
+            <path d="M14.84 13.97v3l2.27-1.5z" fill="var(--accent)" />
+          </svg>
+        </div>
         <div>
           <div>CineVault</div>
           <div className="logo-sub">影视库</div>
@@ -130,7 +170,7 @@ export function Sidebar({
             className={`nav-item${view === it.key ? " active" : ""}`}
             onClick={() => onView(it.key)}
           >
-            <NavIcon path={it.icon} />
+            <NavIcon>{ICONS[it.icon]}</NavIcon>
             <span>{it.label}</span>
             {it.badge !== undefined && it.badge > 0 && (
               <span className="nav-badge">{it.badge}</span>
@@ -140,7 +180,7 @@ export function Sidebar({
 
         {pendingCount > 0 && (
           <button className="nav-item" onClick={onOpenPending} style={{ color: "var(--accent)" }}>
-            <NavIcon path="pending" />
+            <NavIcon>{ICONS.pending}</NavIcon>
             <span>待确认分类</span>
             <span className="nav-badge" style={{ background: "var(--accent-dim)", color: "var(--accent)" }}>
               {pendingCount}
