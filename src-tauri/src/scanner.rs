@@ -9,6 +9,22 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
     "ogv", "3gp", "f4v", "mts", "m2ts", "divx", "asf", "rm", "tp",
 ];
 
+/// 体积下限（字节）：小于该值的视频文件不入库，刷新扫描时一并清除记录。
+/// 50MB 的依据（2026-09-02 生产库 5216 条实测）：50~110MB 区间 662 条几乎全是正片
+/// （海绵宝宝/Family Guy/灌篮高手 HALFCD 等），50MB 以下垃圾浓度高（广告水印/BD Menu/预告片/sample）。
+/// 50MB 以下仍需保留的正片走 SIZE_EXEMPT_PREFIXES 豁免。
+pub const MIN_VIDEO_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 体积豁免名单（文件名前缀）：名单内文件不受体积下限限制，扫描照常入库、刷新不删。
+/// 「欢乐正前方」27 集横跨 9.87~131.95MB，低段 14 集小于 50MB，属用户点名保留的正片。
+/// 以后若有同类"小体积正片"，加进这个数组即可。
+pub const SIZE_EXEMPT_PREFIXES: &[&str] = &["欢乐正前方"];
+
+/// 是否豁免体积过滤（按文件名前缀匹配）
+pub fn is_size_exempt(file_name: &str) -> bool {
+    SIZE_EXEMPT_PREFIXES.iter().any(|p| file_name.starts_with(p))
+}
+
 pub fn is_video_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -24,6 +40,17 @@ pub fn scan_directory_reporting(path: &str) -> (Vec<PathBuf>, Vec<String>) {
         match entry {
             Ok(e) => {
                 if e.file_type().is_file() && is_video_file(e.path()) {
+                    // 体积下限：小文件（广告水印/BD Menu/预告片/sample）直接不进扫描列表，
+                    // 三个入库口（scan_folder/add_series_from_folder/refresh_all_scans）共用此处，一处过滤全覆盖。
+                    // walkdir 的 DirEntry::metadata() 在 Windows 上直接用目录枚举缓存，无额外系统调用。
+                    if let Ok(meta) = e.metadata() {
+                        if meta.len() < MIN_VIDEO_SIZE_BYTES {
+                            let name = e.file_name().to_string_lossy();
+                            if !is_size_exempt(&name) {
+                                continue;
+                            }
+                        }
+                    }
                     files.push(e.path().to_path_buf());
                 }
             }
@@ -117,5 +144,24 @@ pub fn extract_video_info(path: &Path, sibling_map: &HashMap<PathBuf, Vec<String
         series_name: c.series_name,
         season: c.season,
         episode: c.episode,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size_exempt_prefix_match() {
+        assert!(is_size_exempt("欢乐正前方.大灰狼和三只小猪的故事.mkv"));
+        assert!(is_size_exempt("欢乐正前方.mkv"));
+        assert!(!is_size_exempt("欢乐正前.mkv"));
+        assert!(!is_size_exempt("海绵宝宝.S01E01.mp4"));
+        assert!(!is_size_exempt(""));
+    }
+
+    #[test]
+    fn test_min_video_size_value() {
+        assert_eq!(MIN_VIDEO_SIZE_BYTES, 52_428_800);
     }
 }

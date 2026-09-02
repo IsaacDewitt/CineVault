@@ -406,15 +406,19 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
         }
     }
 
-    // 第二阶段：清理磁盘上已不存在的记录
+    // 第二阶段：清理磁盘上已不存在的记录 + 体积低于下限的小文件记录（豁免名单除外）。
+    // 扫描口（scan_directory_reporting）已挡住小文件入库，这里负责清掉历史存量，
+    // 并兜住"文件被替换成小体积版本"的情况。外键 ON DELETE CASCADE 自动清观看历史。
     let mut removed: i64 = 0;
-    let videos: Vec<(i64, String)> = {
+    let videos: Vec<(i64, String, String, i64)> = {
         let mut stmt = conn
-            .prepare("SELECT id, file_path FROM videos")
+            .prepare("SELECT id, file_path, file_name, file_size FROM videos")
             .map_err(|e| AppError::db(e.to_string()))?;
         let mut out = Vec::new();
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .map_err(|e| AppError::db(e.to_string()))?;
         for r in rows {
             if let Ok(v) = r {
@@ -427,8 +431,10 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
         let tx = conn
             .transaction()
             .map_err(|e| AppError::db(e.to_string()))?;
-        for (id, file_path) in &videos {
-            if !Path::new(file_path).exists() {
+        for (id, file_path, file_name, file_size) in &videos {
+            let too_small =
+                (*file_size as u64) < scanner::MIN_VIDEO_SIZE_BYTES && !scanner::is_size_exempt(file_name);
+            if !Path::new(file_path).exists() || too_small {
                 match tx.execute("DELETE FROM videos WHERE id = ?1", rusqlite::params![id]) {
                     Ok(_) => removed += 1,
                     Err(e) => errors.push(format!("删除记录失败 ({}): {}", file_path, e)),
