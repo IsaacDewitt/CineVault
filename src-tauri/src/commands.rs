@@ -716,64 +716,93 @@ pub fn mark_played(db: State<'_, DbConn>, video_id: i64) -> Result<(), String> {
 
 /// 用系统 Shell 打开路径（等价于在资源管理器里双击）。
 ///
-/// **历史**（2026-08-30 起改走 `cmd /c start`）：
-/// - v1：直接 `open::that()`，Windows 上经 PowerShell 派发。冷启动 ~130ms，
-///   且 PS 的 `$PWD` 是 `C:\WINDOWS\system32`，新进程继承它会让 PotPlayer
-///   启动卡一会（要枚举工作目录生成「打开文件」对话框，4749 个文件拖慢初始化）。
-/// - v2：手写 ShellExecuteExW + 独立线程 + STA CoInit。零中间进程、显式 `lpDirectory`。
-///   但 2026-08-30 实测在新版 exe 上偶发让 PotPlayer 在 `nvwgf2umx.dll`
-///   0xC0000005（NVIDIA D3D 用户模式驱动）崩溃；同一文件直接双击 OK，
-///   即差异来自 CineVault 的启动方式。
-/// - **v3（当前）**：走 `cmd /c start "" "<path>"`，再以 `current_dir(<dir>)`
-///   控制新进程工作目录。cmd 冷启动 ~19ms 比 PS 快一个量级；启动语义跟
-///   资源管理器双击一致（新进程 CWD = 文件所在目录）；不依赖 COM 状态、
-///   不开新 OS 线程、不写任何 FFI，启动最简——把已知崩溃路径完全绕开。
+/// **历史**（四代演进，2026-09-02 起 v4）：
+/// - v1：`open::that()`，Windows 上经 PowerShell 派发。冷启动 ~130ms，多一个进程，路径经环境变量传递。
+/// - v2：手写 ShellExecuteExW + 专用线程 + STA CoInit + 显式 `lpDirectory`。
+///   曾偶发 PotPlayer 在 `nvwgf2umx.dll` 0xC0000005（NVIDIA D3D 驱动）崩溃而弃用；
+///   2026-09-02 A/B 实测：ShellExecuteExW 本身与双击耗时一致（见下），当年崩溃应属
+///   NVIDIA 驱动偶发（4K HEVC + 驱动层的已知崩溃形态），并非本调用方式所致。
+/// - v3：`cmd /c start "" "<path>"` + `current_dir` + 路径走环境变量。规避了解析坑，
+///   但仍多一个 cmd 进程、给 PotPlayer 注入 CINEVAULT_OPEN_TARGET 环境变量、
+///   覆写其 CWD——与双击始终存在三处结构差异，且 env/引号/CWD 三代里各踩过一次坑。
+/// - **v4（当前）**：spawn_blocking 线程上直接 `ShellExecuteExW`（MTA + SEE_MASK_NOASYNC）。
+///   与资源管理器双击**字面上同一个 API、同一条代码路径**：零中间进程、无命令行/环境
+///   变量解析环节、`lpDirectory`/`lpVerb` 均与双击同参（默认动词 + NULL 目录）。
+///   2026-09-02 实测（explorer 派发 vs v3 链路 vs ShellExecuteExW 三方对照，真实 2160p 文件，
+///   含 PotPlayer 已运行换集场景）：三者"拉起到开播"耗时一致（1.3~1.8s，本机热态），
+///   窗口零假死（IsHungAppWindow 采样）；并实测 PotPlayer 的 CWD 与其所在目录大小
+///   （4~4000 文件）对启动耗时无影响——历代"CWD 枚举拖慢启动"的诊断不成立。
 #[cfg(target_os = "windows")]
-fn shell_open(file: &Path, directory: Option<&Path>) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
+fn shell_open(file: &Path, _directory: Option<&Path>) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
 
-    // GUI 程序是 windows_subsystem="windows"，必须给子进程挂这个标志，
-    // 否则 cmd 自己起一扇控制台黑窗（哪怕转瞬即逝也闪眼）。
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // SEE_MASK_NOASYNC：不等 DDE 会话、不在调用线程上排队给 Shell 代理——
+    // 从普通进程发起时语义与双击一致且不会吊住调用线程。
+    const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+    const SW_SHOWNORMAL: i32 = 1;
+    const COINIT_MULTITHREADED: u32 = 0x0;
 
-    // 工作目录：调用方传则用，否则取文件父目录（双击时 Shell 给的也是这个）。
-    let cwd = directory
-        .or_else(|| file.parent())
-        .unwrap_or_else(|| Path::new("."));
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: isize,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: isize,
+        lp_id_list: *mut core::ffi::c_void,
+        lp_class: *const u16,
+        hkey_class: isize,
+        dw_hot_key: u32,
+        h_icon_or_monitor: isize,
+        h_process: isize,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteExW(lp_exec_info: *mut ShellExecuteInfoW) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *const core::ffi::c_void, co_init: u32) -> i32;
+        fn CoUninitialize();
+    }
+
+    let file_w: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut sei = ShellExecuteInfoW {
+        cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+        f_mask: SEE_MASK_NOASYNC,
+        hwnd: 0,
+        lp_verb: std::ptr::null(),      // 默认动词 "open"，与双击相同
+        lp_file: file_w.as_ptr(),
+        lp_parameters: std::ptr::null(),
+        lp_directory: std::ptr::null(), // 与双击同参：不指定工作目录（实测对启动无影响）
+        n_show: SW_SHOWNORMAL,
+        h_inst_app: 0,
+        lp_id_list: std::ptr::null_mut(),
+        lp_class: std::ptr::null(),
+        hkey_class: 0,
+        dw_hot_key: 0,
+        h_icon_or_monitor: 0,
+        h_process: 0,
+    };
+
+    // ShellExecuteExW 要求调用线程已初始化 COM。spawn_blocking 线程默认无 COM 状态：
+    // MTA 初始化 → 调用 → 成对 CoUninitialize，不在复用线程上遗留状态。
+    // RPC_E_CHANGED_MODE（线程已是 STA）时照常调用，仅跳过成对释放。
     let display = file.to_string_lossy().to_string();
-
-    // `start "" "<path>"`：第一个引号串是窗口标题（空串占位，否则 cmd 会把路径当标题）；
-    // 第二个是要启动的文件 / 文件夹，由 `start` 内部 ShellExecute 派发。
-    // **路径经环境变量传递**（`%CINEVAULT_OPEN_TARGET%`），不直接拼命令行：
-    // cmd 解析命令行时会展开 %VAR%、把 & 当分隔符、吞 ^ 转义——路径里若出现
-    // 这类字符（如 `100%全集.mkv`）直接拼进去会错乱。环境变量展开只发生在
-    // 这一次 %CINEVAULT_OPEN_TARGET% 上，展开结果不会被二次解析，路径原样到达 start。
-    // 与 open crate 用 $env:OPEN_RS_TARGET 的思路一致。单次 .arg() 而非 .args([...]) 数组：
-    // 数组里 &str 和 &OsStr 混着塞会触发类型不匹配。
-    // 必须用 .raw_arg() 加空格 + 引号：.arg() 遇到无空格的 "%CINEVAULT_OPEN_TARGET%"
-    // 不会自动加引号，env 展开后路径里的空格会把 start 当多参数解析，导致
-    // "H:\...\Arcane S02E05..." 被截断成 "H:\...\Arcane"（实测 2026-08-30）。
-    let status = Command::new("cmd")
-        .env("CINEVAULT_OPEN_TARGET", file.as_os_str())
-        .arg("/c")
-        .arg("start")
-        .arg("")
-        .raw_arg(" \"%CINEVAULT_OPEN_TARGET%\"")
-        .current_dir(cwd)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("启动失败: {} ({})", display, e))?;
-
-    if !status.success() {
-        return Err(format!(
-            "启动失败: {} (cmd exit {})",
-            display,
-            status.code().unwrap_or(-1)
-        ));
+    let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED) };
+    let com_inited = hr == 0 || hr == 1; // S_OK / S_FALSE（已初始化，引用计数 +1）
+    let ok = unsafe { ShellExecuteExW(&mut sei) };
+    if com_inited {
+        unsafe { CoUninitialize() };
+    }
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("打开失败: {} ({})", display, err));
     }
     Ok(())
 }
@@ -792,7 +821,8 @@ pub async fn open_file(path: String) -> Result<(), String> {
         return Err(format!("文件不存在: {}", path));
     }
     tauri::async_runtime::spawn_blocking(move || {
-        // 工作目录设为文件所在目录 —— 与资源管理器双击的行为一致
+        // directory 参数保留给 open_folder 语义（v4 起不再用于覆写子进程 CWD，
+        // 见 shell_open 文档：实测 CWD 对启动耗时无影响，传 NULL 才与双击同参）
         shell_open(Path::new(&path), Path::new(&path).parent())
     })
     .await
