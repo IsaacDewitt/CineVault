@@ -1,0 +1,13 @@
+# 统一换行：仓库内一律 LF，检出时按平台自动转换
+* text=auto
+
+# 二进制资源不做换行转换，也不参与文本 diff
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.icns binary
+*.apk  binary
+*.jks  binary
+*.db   binary
+*.exe  binary
