@@ -12,7 +12,6 @@ export interface Video {
   file_size: number;
   duration: number | null;
   rating: number;
-  is_favorite: boolean;
   kind: VideoKind;
   confidence: number;
   user_kind: string | null;
@@ -20,6 +19,8 @@ export interface Video {
   series_name: string | null;
   season: number | null;
   episode: number | null;
+  /** 合体文件（一个文件含多集）的末集号，如 EP01-03 → 3；单集为 null */
+  episode_end: number | null;
   last_watched_at: string | null;
   watch_progress: number;
   created_at: string;
@@ -46,9 +47,12 @@ export interface SeriesOverview {
   progress: number;
   total_size: number;
   rating: number;
-  is_favorite: boolean;
   last_watched_at: string | null;
   updated_at: string;
+  /** 全部单集时长之和（秒），旧备份 JSON 导入时可能缺省 */
+  total_duration?: number;
+  /** 首集视频 id，用于生成剧集卡片封面；旧备份可能缺省 */
+  cover_video_id?: number | null;
   tags: Tag[];
 }
 
@@ -80,7 +84,6 @@ export interface VideoStats {
   total_videos: number;
   total_series: number;
   total_size: number;
-  favorites_count: number;
   watched_count: number;
   average_rating: number;
   movie_count: number;
@@ -99,6 +102,10 @@ export interface RefreshResult {
   new_added: number;
   moved: number;
   folders_scanned: number;
+  /** 本次自动收紧锚点的剧集数（为无锚点剧集补 folder_path） */
+  anchors_tightened?: number;
+  /** 发生删除前自动生成的整库快照 */
+  backup_path?: string | null;
   errors: string[];
   pending: PendingItem[];
 }
@@ -117,17 +124,25 @@ export interface ScanFolder {
   last_scanned_at: string | null;
 }
 
-export type ViewKey =
-  | "all"
-  | "movies"
-  | "series"
-  | "favorites"
-  | "recent"
-  | "history";
+export interface ScanConfig {
+  min_size_mb: number;
+  exempt_prefixes: string[];
+}
 
-export type SortKey = "last_watched" | "updated" | "name" | "size" | "rating";
+export type ViewKey = "all" | "movies" | "series" | "random";
 
-export type WatchStatus = "all" | "unwatched" | "partial" | "watched";
+export type SortKey = "last_watched" | "updated" | "name" | "size" | "rating" | "duration";
+
+/** 排序方向；last_watched/updated 是"最近"语义，后端恒降序，不吃此方向 */
+export type SortDir = "asc" | "desc";
+
+export interface SortSpec {
+  key: SortKey;
+  dir: SortDir;
+}
+
+/** 观看状态（可多选过滤）；勾选集合即过滤集合，三态全选 = 不过滤 */
+export type WatchState = "unwatched" | "partial" | "watched";
 
 export interface ExportData {
   app: string;
@@ -146,6 +161,14 @@ export interface ImportResult {
   imported_tags: number;
   imported_history: number;
   imported_folders: number;
+  /** import_json_from_file 自动生成的导入前整库备份 */
+  backup_path?: string;
+}
+
+export interface ExportFileResult {
+  path: string;
+  videos: number;
+  series: number;
 }
 
 // ============================================
@@ -169,4 +192,20 @@ export interface BackfillResult {
 export interface FfprobeStatus {
   available: boolean;
   path: string | null;
+}
+
+// ============================================
+// 局域网手机访问
+// ============================================
+export interface LanStatus {
+  running: boolean;
+  enabled: boolean;
+  port: number;
+  name: string;
+  token: string;
+  pair_code: string;
+  /** Unix 秒；过期后需在桌面端更换配对码 */
+  pair_expires_at: number;
+  urls: string[];
+  error: string | null;
 }

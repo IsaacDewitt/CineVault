@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::models::*;
@@ -31,7 +32,6 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             name TEXT NOT NULL UNIQUE,
             folder_path TEXT,
             rating REAL NOT NULL DEFAULT 0,
-            is_favorite INTEGER NOT NULL DEFAULT 0,
             last_watched_at TEXT,
             watch_progress REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
@@ -45,13 +45,13 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
             file_size INTEGER NOT NULL DEFAULT 0,
             duration REAL,
             rating REAL NOT NULL DEFAULT 0,
-            is_favorite INTEGER NOT NULL DEFAULT 0,
             kind TEXT NOT NULL DEFAULT 'unknown',
             confidence INTEGER NOT NULL DEFAULT 0,
             user_kind TEXT,
             series_id INTEGER REFERENCES series(id) ON DELETE SET NULL,
             season INTEGER,
             episode INTEGER,
+            episode_end INTEGER,
             last_watched_at TEXT,
             watch_progress REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
@@ -99,6 +99,38 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
          );",
     )?;
 
+    // 老库补列（幂等）：episode_end（合体文件末集号，如 EP01-03）。
+    // CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，只能查 table_info 后 ALTER；
+    // 新库上面建表语句已带该列，这里直接跳过。
+    if !column_exists(conn, "videos", "episode_end")? {
+        conn.execute_batch("ALTER TABLE videos ADD COLUMN episode_end INTEGER;")?;
+    }
+
+    // Windows 文件路径大小写不敏感。存量若已有仅大小写不同的重复行，
+    // 唯一索引无法建立（会直接让应用启动失败），此时保留数据、只打印告警；
+    // 没有重复时才建索引，从此数据库层也挡住新重复。
+    let path_dupes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT file_path FROM videos
+            GROUP BY file_path COLLATE NOCASE
+            HAVING COUNT(*) > 1
+         )",
+        [],
+        |r| r.get(0),
+    )?;
+    if path_dupes == 0 {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_file_path_nocase_unique
+             ON videos(file_path COLLATE NOCASE);",
+        )?;
+    } else {
+        eprintln!(
+            "[cinevault] 检测到 {} 组仅大小写不同的重复路径，暂不建立 NOCASE 唯一索引；\
+             请先用“导出备份 + 手工清理重复记录”处理。",
+            path_dupes
+        );
+    }
+
     // P-7：启动去重一次性开关。上面主 batch 里不能放这个 DELETE——它不是幂等操作，
     // 每次冷启动都要全表扫描 + 分组（2,433 条时 0.66ms，10 万条约 30ms，随库线性涨）。
     // 用 settings 里的标志保证库生命周期内只清一次存量重复 + 建一次唯一索引；
@@ -122,6 +154,19 @@ pub fn initialize_database(conn: &Connection) -> Result<(), AppError> {
         conn.execute("INSERT INTO schema_version (version) VALUES (?1)", params![SCHEMA_VERSION])?;
     }
     Ok(())
+}
+
+/// 表里是否已有某列（PRAGMA table_info，用于老库幂等补列）
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, AppError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ============================================
@@ -155,22 +200,22 @@ fn row_to_video(row: &Row) -> rusqlite::Result<Video> {
         file_size: row.get(4)?,
         duration: row.get(5)?,
         rating: row.get(6)?,
-        is_favorite: row.get::<_, i32>(7)? != 0,
-        kind: row.get(8)?,
-        confidence: row.get(9)?,
-        user_kind: row.get(10)?,
-        series_id: row.get(11)?,
-        series_name: row.get(12)?,
-        season: row.get(13)?,
-        episode: row.get(14)?,
-        last_watched_at: row.get(15)?,
-        watch_progress: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        kind: row.get(7)?,
+        confidence: row.get(8)?,
+        user_kind: row.get(9)?,
+        series_id: row.get(10)?,
+        series_name: row.get(11)?,
+        season: row.get(12)?,
+        episode: row.get(13)?,
+        episode_end: row.get(18)?,
+        last_watched_at: row.get(14)?,
+        watch_progress: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
-const VIDEO_COLS: &str = "v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating, v.is_favorite, v.kind, v.confidence, v.user_kind, v.series_id, s.name, v.season, v.episode, v.last_watched_at, v.watch_progress, v.created_at, v.updated_at";
+const VIDEO_COLS: &str = "v.id, v.title, v.file_path, v.file_name, v.file_size, v.duration, v.rating, v.kind, v.confidence, v.user_kind, v.series_id, s.name, v.season, v.episode, v.last_watched_at, v.watch_progress, v.created_at, v.updated_at, v.episode_end";
 
 fn row_to_series_overview(row: &Row) -> rusqlite::Result<SeriesOverview> {
     Ok(SeriesOverview {
@@ -182,9 +227,10 @@ fn row_to_series_overview(row: &Row) -> rusqlite::Result<SeriesOverview> {
         progress: row.get(5)?,
         total_size: row.get(6)?,
         rating: row.get(7)?,
-        is_favorite: row.get::<_, i32>(8)? != 0,
-        last_watched_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        last_watched_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        total_duration: row.get(10)?,
+        cover_video_id: row.get(11)?,
         tags: Vec::new(),
     })
 }
@@ -192,23 +238,41 @@ fn row_to_series_overview(row: &Row) -> rusqlite::Result<SeriesOverview> {
 /// 一集算"看过"的判定：watch_progress >= 99.9，与前端 VideoList.watched() 保持一致。
 /// 剧集聚合（已看集数 / 进度）必须同源，否则卡片会同时显示"已看 1/46 集"和"进度条 100%"——
 /// 旧实现 progress 取 MAX(单集进度)，看 1 集就满格，与旁边的集数自相矛盾。
+/// 一个视频文件代表的集数：普通单集 = 1，合体文件 EP01-03 = 3。
+/// 剧集进度、已看集数、全剧标记都必须使用同一口径，否则界面会出现
+/// “已看 1/20 集、进度条 100%”这种自相矛盾。
+fn episode_span_expr(alias: &str) -> String {
+    format!(
+        "(CASE WHEN {a}.episode IS NULL THEN 1 \
+         WHEN {a}.episode_end IS NOT NULL AND {a}.episode_end >= {a}.episode \
+         THEN {a}.episode_end - {a}.episode + 1 ELSE 1 END)",
+        a = alias
+    )
+}
+
 fn series_progress_expr(series_alias: &str) -> String {
+    let span = episode_span_expr("v");
     format!(
         "(SELECT CASE WHEN COUNT(*) = 0 THEN 0.0 \
-         ELSE 100.0 * SUM(CASE WHEN v.watch_progress >= 99.9 THEN 1 ELSE 0 END) / COUNT(*) END \
+         ELSE 100.0 * SUM(CASE WHEN v.watch_progress >= 99.9 THEN {span} ELSE 0 END) / SUM({span}) END \
          FROM videos v WHERE v.series_id = {}.id)",
         series_alias
     )
 }
 
 fn series_overview_cols() -> String {
+    let span = episode_span_expr("v");
     format!(
         "se.id, se.name, se.folder_path,
-         (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id) AS total_episodes,
-         (SELECT COUNT(*) FROM videos v WHERE v.series_id = se.id AND v.watch_progress >= 99.9) AS watched_episodes,
+         (SELECT COALESCE(SUM({span}), 0) FROM videos v WHERE v.series_id = se.id) AS total_episodes,
+         (SELECT COALESCE(SUM(CASE WHEN v.watch_progress >= 99.9 THEN {span} ELSE 0 END), 0)
+            FROM videos v WHERE v.series_id = se.id) AS watched_episodes,
          {} AS progress,
          (SELECT COALESCE(SUM(v.file_size), 0) FROM videos v WHERE v.series_id = se.id) AS total_size,
-         se.rating, se.is_favorite, se.last_watched_at, se.updated_at",
+         se.rating, se.last_watched_at, se.updated_at,
+         (SELECT COALESCE(SUM(v.duration), 0) FROM videos v WHERE v.series_id = se.id) AS total_duration,
+         (SELECT v.id FROM videos v WHERE v.series_id = se.id
+            ORDER BY COALESCE(v.season, 1), COALESCE(v.episode, 0), v.file_name LIMIT 1) AS cover_video_id",
         series_progress_expr("se")
     )
 }
@@ -225,18 +289,18 @@ pub fn upsert_video(
     p: &VideoUpsertParams,
     move_match: bool,
 ) -> Result<UpsertResult, AppError> {
-    // 1. 精确路径
+    // 1. 精确路径（NOCASE：Windows 文件系统大小写不敏感，避免大小写变体产生重复记录）
     if let Ok(row) = tx.query_row(
-        "SELECT id FROM videos WHERE file_path = ?1",
+        "SELECT id FROM videos WHERE file_path = ?1 COLLATE NOCASE",
         params![p.file_path],
         |r| r.get::<_, i64>(0),
     ) {
         tx.execute(
             "UPDATE videos SET title=?1, file_size=?2, duration=COALESCE(duration, ?3),
              kind = CASE WHEN user_kind IS NOT NULL THEN user_kind ELSE ?4 END,
-             confidence=?5, series_id=?6, season=?7, episode=?8,
-             updated_at=datetime('now','localtime') WHERE id=?9",
-            params![p.title, p.file_size, p.duration, p.kind, p.confidence, p.series_id, p.season, p.episode, row],
+             confidence=?5, series_id=?6, season=?7, episode=?8, episode_end=?9,
+             updated_at=datetime('now','localtime') WHERE id=?10",
+            params![p.title, p.file_size, p.duration, p.kind, p.confidence, p.series_id, p.season, p.episode, p.episode_end, row],
         )?;
         return Ok(UpsertResult::Updated(row));
     }
@@ -251,7 +315,7 @@ pub fn upsert_video(
         if let Some(sid) = p.series_id {
             let hit: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT id, file_path FROM videos WHERE file_name = ?1 AND series_id = ?2 ORDER BY id LIMIT 1",
+                    "SELECT id, file_path FROM videos WHERE file_name = ?1 COLLATE NOCASE AND series_id = ?2 ORDER BY id LIMIT 1",
                     params![p.file_name, sid],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -261,10 +325,11 @@ pub fn upsert_video(
                     tx.execute(
                         "UPDATE videos SET file_path=?1, title=?2, file_size=?3, series_id=?4,
                          season=COALESCE(?5, season), episode=COALESCE(?6, episode),
-                         user_kind=COALESCE(user_kind, ?7),
-                         duration=COALESCE(duration, ?8),
-                         updated_at=datetime('now','localtime') WHERE id=?9",
-                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, p.user_kind, p.duration, old_id],
+                         episode_end=COALESCE(?7, episode_end),
+                         user_kind=COALESCE(user_kind, ?8),
+                         duration=COALESCE(duration, ?9),
+                         updated_at=datetime('now','localtime') WHERE id=?10",
+                        params![p.file_path, p.title, p.file_size, sid, p.season, p.episode, p.episode_end, p.user_kind, p.duration, old_id],
                     )?;
                     return Ok(UpsertResult::Updated(old_id));
                 }
@@ -273,7 +338,7 @@ pub fn upsert_video(
         // 2b. 全库唯一同名才认领（多条同名 = 有歧义，宁插入不串记录）
         let same_name: Vec<(i64, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, file_path FROM videos WHERE file_name = ?1 ORDER BY id",
+                "SELECT id, file_path FROM videos WHERE file_name = ?1 COLLATE NOCASE ORDER BY id",
             )?;
             let rows = stmt.query_map(params![p.file_name], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -292,10 +357,11 @@ pub fn upsert_video(
                 tx.execute(
                     "UPDATE videos SET file_path=?1, title=?2, file_size=?3,
                      season=COALESCE(?4, season), episode=COALESCE(?5, episode),
-                     user_kind=COALESCE(user_kind, ?6),
-                     duration=COALESCE(duration, ?7),
-                     updated_at=datetime('now','localtime') WHERE id=?8",
-                    params![p.file_path, p.title, p.file_size, p.season, p.episode, p.user_kind, p.duration, old_id],
+                     episode_end=COALESCE(?6, episode_end),
+                     user_kind=COALESCE(user_kind, ?7),
+                     duration=COALESCE(duration, ?8),
+                     updated_at=datetime('now','localtime') WHERE id=?9",
+                    params![p.file_path, p.title, p.file_size, p.season, p.episode, p.episode_end, p.user_kind, p.duration, old_id],
                 )?;
                 return Ok(UpsertResult::Updated(old_id));
             }
@@ -304,11 +370,11 @@ pub fn upsert_video(
 
     // 3. 插入
     tx.execute(
-        "INSERT INTO videos (title, file_path, file_name, file_size, duration, kind, confidence, user_kind, series_id, season, episode, last_watched_at, watch_progress)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO videos (title, file_path, file_name, file_size, duration, kind, confidence, user_kind, series_id, season, episode, episode_end, last_watched_at, watch_progress)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             p.title, p.file_path, p.file_name, p.file_size, p.duration,
-            p.kind, p.confidence, p.user_kind, p.series_id, p.season, p.episode,
+            p.kind, p.confidence, p.user_kind, p.series_id, p.season, p.episode, p.episode_end,
             p.default_watched.then(|| chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
             if p.default_watched { 100.0 } else { 0.0 }
         ],
@@ -359,23 +425,40 @@ pub fn query_videos_paginated(
     page: i64,
     page_size: i64,
     min_rating: f64,
+    max_rating: f64,
     sort: &str,
+    order: &str,
 ) -> Result<PaginatedVideos, AppError> {
     let where_sql = if conditions.is_empty() {
         "WHERE (v.kind = 'movie' OR v.kind = 'unknown' OR v.kind = 'series')".to_string()
     } else {
         format!("WHERE {}", conditions.join(" AND "))
     };
+    // 评分区间：min>0 才加下限（0=不看下限），max<10 才加上限（10=不看上限），
+    // 由命令层把"未启用/全距"归一成 (0, 10)，两个条件都不加即等价于不过滤。
     let where_sql = if min_rating > 0.0 {
         format!("{} AND v.rating >= {}", where_sql, min_rating)
     } else {
         where_sql
     };
+    let where_sql = if max_rating < 10.0 {
+        format!("{} AND v.rating <= {}", where_sql, max_rating)
+    } else {
+        where_sql
+    };
+    // 排序 = 维度 + 方向（白名单）；order 非 "asc" 一律按降序处理。
+    // last_watched / updated 是"最近"语义，方向恒为降序，不受 asc 影响。
+    // v.rating = 0 与 v.duration IS NULL 置于排序首位，把未评分/缺时长沉底。
+    let desc = order != "asc";
     let order = match sort {
-        "name" => "ORDER BY v.title COLLATE NOCASE, v.id",
-        "size" => "ORDER BY v.file_size DESC, v.id",
-        "rating" => "ORDER BY v.rating DESC, v.id",
+        "name" => if desc { "ORDER BY v.title COLLATE NOCASE DESC, v.id" } else { "ORDER BY v.title COLLATE NOCASE, v.id" },
+        "size" => if desc { "ORDER BY v.file_size DESC, v.id" } else { "ORDER BY v.file_size, v.id" },
+        "rating" => if desc { "ORDER BY v.rating = 0, v.rating DESC, v.id" } else { "ORDER BY v.rating = 0, v.rating, v.id" },
         "updated" => "ORDER BY v.updated_at DESC, v.id",
+        // 随机推荐：每次执行即重抽一次；随机序没有方向可言，不吃 asc/desc
+        "random" => "ORDER BY RANDOM()",
+        // 时长排序：v.duration IS NULL 放首位把缺时长的沉底，ASC/DESC 都不影响有值部分的顺序
+        "duration" => if desc { "ORDER BY v.duration IS NULL, v.duration DESC, v.id" } else { "ORDER BY v.duration IS NULL, v.duration ASC, v.id" },
         _ => "ORDER BY COALESCE(v.last_watched_at, '') DESC, v.id",
     };
 
@@ -388,35 +471,43 @@ pub fn query_videos_paginated(
         ""
     };
 
+    // COUNT 与数据页必须来自同一读快照；否则桌面端并发扫描/改进度时，
+    // total 和 items 可能描述两个不同版本，手机端分页会重复或漏项。
+    let tx = conn.unchecked_transaction()?;
     let total: i64 = {
         let sql = format!("SELECT COUNT(*) FROM videos v{} {}", series_join, where_sql);
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = tx.prepare(&sql)?;
         stmt.query_row(cond_params, |r| r.get(0))?
     };
 
-    let sql = format!(
-        "SELECT {} FROM videos v LEFT JOIN series s ON s.id = v.series_id {} {} LIMIT ?{} OFFSET ?{}",
-        VIDEO_COLS, where_sql, order,
-        cond_params.len() + 1, cond_params.len() + 2
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    for p in cond_params {
-        params_vec.push(Box::new(*p));
-    }
+    let (videos, ids) = {
+        let sql = format!(
+            "SELECT {} FROM videos v LEFT JOIN series s ON s.id = v.series_id {} {} LIMIT ?{} OFFSET ?{}",
+            VIDEO_COLS, where_sql, order,
+            cond_params.len() + 1, cond_params.len() + 2
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for p in cond_params {
+            params_vec.push(Box::new(*p));
+        }
     params_vec.push(Box::new(page_size));
-    params_vec.push(Box::new(page * page_size));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    params_vec.push(Box::new(page.saturating_mul(page_size)));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
 
-    let rows = stmt.query_map(param_refs.as_slice(), row_to_video)?;
-    let mut videos = Vec::new();
-    let mut ids = Vec::new();
-    for r in rows {
-        let v = r?;
-        ids.push(v.id);
-        videos.push(v);
-    }
-    let tag_map = load_tags_for(conn, &ids)?;
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_video)?;
+        let mut videos = Vec::new();
+        let mut ids = Vec::new();
+        for r in rows {
+            let v = r?;
+            ids.push(v.id);
+            videos.push(v);
+        }
+        (videos, ids)
+    };
+    let tag_map = load_tags_for(&tx, &ids)?;
+    tx.commit()?;
     let items = videos
         .into_iter()
         .map(|video| VideoWithTags {
@@ -425,7 +516,13 @@ pub fn query_videos_paginated(
         })
         .collect();
 
-    Ok(PaginatedVideos { items, total, page, page_size, has_more: (page + 1) * page_size < total })
+    Ok(PaginatedVideos {
+        items,
+        total,
+        page,
+        page_size,
+        has_more: page.saturating_add(1).saturating_mul(page_size) < total,
+    })
 }
 
 pub fn get_recently_added_videos(
@@ -434,11 +531,12 @@ pub fn get_recently_added_videos(
     page_size: i64,
     min_rating: f64,
 ) -> Result<PaginatedVideos, AppError> {
-    // min_rating 由 query_videos_paginated 内部追加，这里不要再 push 一次（否则 SQL 出现重复条件）
+    // min_rating / max_rating 由 query_videos_paginated 内部追加，这里不要再 push 一次（否则 SQL 出现重复条件）
     let conditions = vec!["datetime(v.created_at) >= datetime('now', '-7 days')".to_string()];
     let params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    query_videos_paginated(conn, &conditions, &param_refs, page, page_size, min_rating, "updated")
+    // "最近更新"视图：updated 恒为降序，评分区间传全距 (0, 10) = 不加条件
+    query_videos_paginated(conn, &conditions, &param_refs, page, page_size, min_rating, 10.0, "updated", "desc")
 }
 
 pub fn get_video_by_id(conn: &Connection, video_id: i64) -> Result<VideoWithTags, AppError> {
@@ -456,12 +554,29 @@ pub fn get_video_by_id(conn: &Connection, video_id: i64) -> Result<VideoWithTags
 // 剧集
 // ============================================
 pub fn upsert_series(conn: &Connection, name: &str, folder: Option<&str>) -> Result<i64, AppError> {
+    // 先做 NOCASE 命中，避免 “The Boys” / “the boys” 在 Windows 来源里被当成两部剧。
+    // 旧库若已有大小写重复，这里会复用最早那条，不再新增。
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM series WHERE name = ?1 COLLATE NOCASE ORDER BY id LIMIT 1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        if folder.is_some() {
+            conn.execute(
+                "UPDATE series SET folder_path = COALESCE(?1, folder_path) WHERE id = ?2",
+                params![folder, id],
+            )?;
+        }
+        return Ok(id);
+    }
     conn.execute(
-        "INSERT INTO series (name, folder_path) VALUES (?1, ?2)
-         ON CONFLICT(name) DO UPDATE SET folder_path = COALESCE(excluded.folder_path, series.folder_path)",
+        "INSERT INTO series (name, folder_path) VALUES (?1, ?2)",
         params![name, folder],
     )?;
-    Ok(conn.query_row("SELECT id FROM series WHERE name = ?1", params![name], |r| r.get(0))?)
+    Ok(conn.last_insert_rowid())
 }
 
 pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, AppError> {
@@ -507,6 +622,16 @@ pub fn get_series_overview(conn: &Connection) -> Result<Vec<SeriesOverview>, App
     Ok(list)
 }
 
+/// 新单集入库后刷新剧集自身的 updated_at，让“最近更新”排序反映新内容。
+/// 只应在确实插入新视频时调用，避免每次扫描都把整库剧集顶到最前。
+pub fn touch_series(conn: &Connection, series_id: i64) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE series SET updated_at = datetime('now','localtime') WHERE id = ?1",
+        params![series_id],
+    )?;
+    Ok(())
+}
+
 pub fn get_series_episodes(conn: &Connection, series_id: i64) -> Result<Vec<VideoWithTags>, AppError> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM videos v LEFT JOIN series s ON s.id = v.series_id
@@ -541,19 +666,6 @@ pub fn update_rating(conn: &Connection, video_id: i64, rating: f64) -> Result<()
         params![rating, video_id],
     )?;
     Ok(())
-}
-
-pub fn toggle_favorite(conn: &Connection, video_id: i64) -> Result<bool, AppError> {
-    conn.execute(
-        "UPDATE videos SET is_favorite = 1 - is_favorite, updated_at = datetime('now','localtime') WHERE id = ?1",
-        params![video_id],
-    )?;
-    let fav: i32 = conn.query_row(
-        "SELECT is_favorite FROM videos WHERE id = ?1",
-        params![video_id],
-        |r| r.get(0),
-    )?;
-    Ok(fav != 0)
 }
 
 pub fn update_watch_progress(conn: &Connection, video_id: i64, progress: f64) -> Result<(), AppError> {
@@ -867,6 +979,26 @@ pub fn create_tag(conn: &Connection, name: &str, color: &str) -> Result<Tag, App
 }
 
 pub fn update_tag(conn: &Connection, tag_id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), AppError> {
+    let name = match name {
+        Some(n) => {
+            let n = n.trim();
+            if n.is_empty() {
+                return Err(AppError::validation("标签名不能为空"));
+            }
+            let duplicate: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND id != ?2 LIMIT 1",
+                    params![n, tag_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if duplicate.is_some() {
+                return Err(AppError::validation("已存在同名标签"));
+            }
+            Some(n)
+        }
+        None => None,
+    };
     match (name, color) {
         (Some(n), Some(c)) => {
             conn.execute("UPDATE tags SET name = ?1, color = ?2 WHERE id = ?3", params![n, c, tag_id])?;
@@ -966,6 +1098,9 @@ pub fn resolve_pending(
     kind: &str,
     series_name: Option<&str>,
 ) -> Result<(), AppError> {
+    if kind != "movie" && kind != "series" {
+        return Err(AppError::validation("分类只能是 movie 或 series"));
+    }
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE videos SET user_kind = ?1, kind = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
@@ -986,6 +1121,7 @@ pub fn resolve_pending(
             params![video_id],
         )?;
     }
+    delete_orphan_series(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -995,7 +1131,19 @@ pub fn resolve_pending(
 // ============================================
 pub fn delete_video(conn: &Connection, video_id: i64) -> Result<(), AppError> {
     conn.execute("DELETE FROM videos WHERE id = ?1", params![video_id])?;
+    delete_orphan_series(conn)?;
     Ok(())
+}
+
+/// 删除已经没有单集的空壳剧集。只由“删视频 / 扫描清理 / 改归属”触发，
+/// 不主动清理用户通过其他途径创建的剧集实体。
+pub fn delete_orphan_series(conn: &Connection) -> Result<i64, AppError> {
+    let removed = conn.execute(
+        "DELETE FROM series
+         WHERE NOT EXISTS (SELECT 1 FROM videos v WHERE v.series_id = series.id)",
+        [],
+    )?;
+    Ok(removed as i64)
 }
 
 pub fn delete_series(conn: &Connection, series_id: i64) -> Result<(), AppError> {
@@ -1004,7 +1152,21 @@ pub fn delete_series(conn: &Connection, series_id: i64) -> Result<(), AppError> 
     Ok(())
 }
 
+/// 该剧集下所有视频的 id。
+///
+/// 必须在 `delete_series` **之前**调用——DELETE 之后就查不出来了，
+/// 而 `thumbnails/{id}.jpg` 的清理正需要这批 id。
+pub fn list_series_video_ids(conn: &Connection, series_id: i64) -> Result<Vec<i64>, AppError> {
+    let mut stmt = conn.prepare("SELECT id FROM videos WHERE series_id = ?1")?;
+    let rows = stmt.query_map(params![series_id], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<Result<Vec<i64>, _>>()?)
+}
+
 pub fn rename_video(conn: &Connection, video_id: i64, new_title: String) -> Result<(), AppError> {
+    let new_title = new_title.trim();
+    if new_title.is_empty() {
+        return Err(AppError::validation("视频标题不能为空"));
+    }
     conn.execute(
         "UPDATE videos SET title = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
         params![new_title, video_id],
@@ -1017,6 +1179,16 @@ pub fn rename_series(conn: &Connection, series_id: i64, new_name: String) -> Res
     if new_name.is_empty() {
         return Err(AppError::validation("剧集名不能为空"));
     }
+    let duplicate: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM series WHERE name = ?1 COLLATE NOCASE AND id != ?2 LIMIT 1",
+            params![new_name, series_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if duplicate.is_some() {
+        return Err(AppError::validation("已存在同名剧集"));
+    }
     conn.execute(
         "UPDATE series SET name = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
         params![new_name, series_id],
@@ -1027,7 +1199,16 @@ pub fn rename_series(conn: &Connection, series_id: i64, new_name: String) -> Res
 /// 全剧标记已看/未看（同步所有单集进度 + 剧集实体）
 pub fn mark_series_watched(conn: &Connection, series_id: i64, watched: bool) -> Result<i64, AppError> {
     let p: f64 = if watched { 100.0 } else { 0.0 };
-    let count = conn.execute(
+    // 返回“集数”而非“文件数”：合体文件 EP01-03 应计 3 集，与卡片口径一致。
+    let span = episode_span_expr("v");
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT COALESCE(SUM({span}), 0) FROM videos v WHERE v.series_id = ?1"
+        ),
+        params![series_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
         "UPDATE videos SET watch_progress = ?1, updated_at = datetime('now','localtime') WHERE series_id = ?2",
         params![p, series_id],
     )?;
@@ -1035,7 +1216,7 @@ pub fn mark_series_watched(conn: &Connection, series_id: i64, watched: bool) -> 
         "UPDATE series SET watch_progress = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
         params![p, series_id],
     )?;
-    Ok(count as i64)
+    Ok(count)
 }
 
 // ============================================
@@ -1044,20 +1225,19 @@ pub fn mark_series_watched(conn: &Connection, series_id: i64, watched: bool) -> 
 pub fn get_stats(conn: &Connection) -> Result<VideoStats, AppError> {
     // P-8：原来 7 次独立 query_row = 7 次全表扫描；合成一条后 SQLite 一次遍历出全部列。
     // 被 afterDataChange 高频调用，量小但白送的 11% + 随库放大的往返次数都省了。
-    let (total_videos, total_series, total_size, favorites_count, watched_count, average_rating, movie_count) =
+    let (total_videos, total_series, total_size, watched_count, average_rating, movie_count) =
         conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM videos),
                 (SELECT COUNT(*) FROM series),
                 (SELECT COALESCE(SUM(file_size), 0) FROM videos),
-                (SELECT COUNT(*) FROM videos WHERE is_favorite = 1),
                 (SELECT COUNT(DISTINCT video_id) FROM watch_history),
                 (SELECT COALESCE(AVG(rating), 0) FROM videos WHERE rating > 0),
                 (SELECT COUNT(*) FROM videos WHERE kind = 'movie')",
             [],
             |r| {
                 Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
                 ))
             },
         )?;
@@ -1065,7 +1245,6 @@ pub fn get_stats(conn: &Connection) -> Result<VideoStats, AppError> {
         total_videos,
         total_series,
         total_size,
-        favorites_count,
         watched_count,
         average_rating,
         movie_count,
@@ -1100,6 +1279,24 @@ pub fn delete_scan_folder(conn: &Connection, folder_id: i64) -> Result<(), AppEr
 // ============================================
 // 导出 / 导入（JSON 分享格式）
 // ============================================
+/// 导入前的数据库整库快照。使用 SQLite `VACUUM INTO`：它在一个读事务里
+/// 生成完整、已整理页面的独立数据库文件，不会漏掉 WAL 中的最新提交，
+/// 也不会像直接复制 db 文件那样把 -wal 留在原地。
+pub fn backup_database(
+    conn: &Connection,
+    data_dir: &Path,
+    prefix: &str,
+) -> Result<String, AppError> {
+    let dir = data_dir.join("backups");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f");
+    let path = dir.join(format!("{prefix}-{stamp}.db"));
+    let path_str = path.to_string_lossy().to_string();
+    // 同一毫秒重名的概率极低；万一存在，VACUUM INTO 会拒绝覆盖，宁可报错也不动旧备份。
+    conn.execute("VACUUM INTO ?1", params![path_str])?;
+    Ok(path_str)
+}
+
 pub fn export_data(conn: &Connection) -> Result<ExportData, AppError> {
     // 全量视频 + 标签
     let videos: Vec<VideoWithTags> = {
@@ -1159,15 +1356,29 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
     let mut tag_map: HashMap<String, i64> = HashMap::new();
     let mut tags = 0i64;
     for t in &data.tags {
-        // B-9：INSERT ... RETURNING id 一次往返拿 id，省掉原来"插入后再 SELECT 回查"的 N+1
-        let id: i64 = tx.query_row(
-            "INSERT INTO tags (name, color) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET color = excluded.color
-             RETURNING id",
-            params![t.name, t.color],
-            |r| r.get(0),
-        )?;
-        tag_map.insert(t.name.clone(), id);
+        // 先按 NOCASE 查同名，避免备份里的 "SciFi" 与本地 "scifi" 各建一条。
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE ORDER BY id LIMIT 1",
+                params![t.name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE tags SET color = ?1 WHERE id = ?2",
+                    params![t.color, id],
+                )?;
+                id
+            }
+            None => tx.query_row(
+                "INSERT INTO tags (name, color) VALUES (?1, ?2) RETURNING id",
+                params![t.name, t.color],
+                |r| r.get(0),
+            )?,
+        };
+        tag_map.insert(t.name.to_lowercase(), id);
         tags += 1;
     }
 
@@ -1175,29 +1386,41 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
     let mut series_id_by_name: HashMap<String, i64> = HashMap::new();
     let mut series_count = 0i64;
     for s in &data.series {
-        // B-9：同标签，RETURNING id 省一次回查
-        let id: i64 = tx.query_row(
-            "INSERT INTO series (name, folder_path, rating, is_favorite, last_watched_at, watch_progress)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(name) DO UPDATE SET
-                rating = MAX(series.rating, excluded.rating),
-                is_favorite = MAX(series.is_favorite, excluded.is_favorite),
-                folder_path = COALESCE(series.folder_path, excluded.folder_path)
-             RETURNING id",
-            params![
-                s.name,
-                s.folder_path,
-                s.rating,
-                if s.is_favorite { 1 } else { 0 },
-                s.last_watched_at,
-                s.progress
-            ],
-            |r| r.get(0),
-        )?;
-        series_id_by_name.insert(s.name.clone(), id);
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM series WHERE name = ?1 COLLATE NOCASE ORDER BY id LIMIT 1",
+                params![s.name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE series SET
+                        rating = MAX(rating, ?1),
+                        folder_path = COALESCE(folder_path, ?2)
+                     WHERE id = ?3",
+                    params![s.rating, s.folder_path, id],
+                )?;
+                id
+            }
+            None => tx.query_row(
+                "INSERT INTO series (name, folder_path, rating, last_watched_at, watch_progress)
+                 VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
+                params![
+                    s.name,
+                    s.folder_path,
+                    s.rating,
+                    s.last_watched_at,
+                    s.progress
+                ],
+                |r| r.get(0),
+            )?,
+        };
+        series_id_by_name.insert(s.name.to_lowercase(), id);
         // 剧集标签
         for t in &s.tags {
-            if let Some(tid) = tag_map.get(&t.name) {
+            if let Some(tid) = tag_map.get(&t.name.to_lowercase()) {
                 tx.execute(
                     "INSERT OR IGNORE INTO series_tags (series_id, tag_id) VALUES (?1, ?2)",
                     params![id, tid],
@@ -1214,7 +1437,10 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
     let mut video_id_map: HashMap<i64, i64> = HashMap::new();
     for vwt in &data.videos {
         let v = &vwt.video;
-        let series_id = v.series_name.as_ref().and_then(|n| series_id_by_name.get(n).copied());
+        let series_id = v
+            .series_name
+            .as_ref()
+            .and_then(|n| series_id_by_name.get(&n.to_lowercase()).copied());
         let result = upsert_video(
             &tx,
             &VideoUpsertParams {
@@ -1229,21 +1455,27 @@ pub fn import_data(conn: &Connection, data: &ExportData) -> Result<ImportResult,
                 series_id,
                 season: v.season,
                 episode: v.episode,
+                episode_end: v.episode_end,
                 default_watched: false,
             },
             false,
         )?;
         let vid = result.id();
+        if result.is_inserted() {
+            if let Some(sid) = series_id {
+                touch_series(&tx, sid)?;
+            }
+        }
         video_id_map.insert(v.id, vid);
-        // 评分/收藏/进度（导入值优先）
+        // 评分/进度（导入值优先）
         tx.execute(
-            "UPDATE videos SET rating = ?1, is_favorite = ?2, watch_progress = ?3, last_watched_at = COALESCE(last_watched_at, ?4)
-             WHERE id = ?5",
-            params![v.rating, if v.is_favorite { 1 } else { 0 }, v.watch_progress, v.last_watched_at, vid],
+            "UPDATE videos SET rating = ?1, watch_progress = ?2, last_watched_at = COALESCE(last_watched_at, ?3)
+             WHERE id = ?4",
+            params![v.rating, v.watch_progress, v.last_watched_at, vid],
         )?;
         // 标签
         for t in &vwt.tags {
-            if let Some(tid) = tag_map.get(&t.name) {
+            if let Some(tid) = tag_map.get(&t.name.to_lowercase()) {
                 tx.execute(
                     "INSERT OR IGNORE INTO video_tags (video_id, tag_id) VALUES (?1, ?2)",
                     params![vid, tid],
@@ -1331,8 +1563,43 @@ mod tests {
             series_id: None,
             season: None,
             episode: None,
+            episode_end: None,
             default_watched: false,
         }
+    }
+
+    /// 删剧集时缩略图缓存（`thumbnails/{id}.jpg`）要靠这批 id 定位。
+    /// 这里锁住的是**时序契约**：`delete_series` 之后 id 就查不到了，
+    /// 谁把顺序写反，缓存就永远清不掉——而这种错 cargo check 抓不住。
+    #[test]
+    fn list_series_video_ids_must_precede_delete() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let sid: i64 = tx
+            .query_row("INSERT INTO series (name) VALUES ('测试剧') RETURNING id", [], |r| r.get(0))
+            .unwrap();
+        let mut ids = Vec::new();
+        for ep in 1..=3 {
+            let name = format!("S01E{ep:02}.mkv");
+            let path = format!("E:/t/{name}");
+            let mut p = vp("测试剧", &path, &name);
+            p.series_id = Some(sid);
+            p.season = Some(1);
+            p.episode = Some(ep);
+            ids.push(upsert_video(&tx, &p, false).unwrap().id());
+        }
+        tx.commit().unwrap();
+
+        let mut got = list_series_video_ids(&conn, sid).unwrap();
+        got.sort();
+        ids.sort();
+        assert_eq!(got, ids, "应返回该剧集全部 3 集的 id");
+
+        delete_series(&conn, sid).unwrap();
+        assert!(
+            list_series_video_ids(&conn, sid).unwrap().is_empty(),
+            "删除之后必须查不到——这也正是调用方必须先取 id 的原因"
+        );
     }
 
     /// 回归：2b 分支的 UPDATE 曾写成 `?1?2?3?5?6?7?8`（删 series_id=?4 时漏重编号）却只传 7 个值，
@@ -1376,6 +1643,66 @@ mod tests {
         assert_eq!(count, 1, "不应产生重复行");
     }
 
+    /// 顶栏筛选重设计（2026-09-05）新增 SQL 分支的运行时覆盖：
+    /// 评分区间（min/max）、sort+order 白名单（duration 双向、name 双向、rating 未评沉底、
+    /// 未知 sort 兜底）。这类拼串 SQL cargo check 不报错，只有运行时才炸，按项目铁律补分支测试。
+    #[test]
+    fn video_query_rating_range_and_sort_order() {
+        let mut conn = mem_db();
+        for (title, dur, rating) in [
+            ("Alpha", Some(100.0), 6.0),
+            ("Bravo", Some(200.0), 10.0),
+            ("Charlie", None, 8.0),
+            ("Delta", Some(50.0), 0.0), // 未评分
+        ] {
+            let path = format!("X:/t/{title}.mkv");
+            let name = format!("{title}.mkv");
+            let mut p = vp(title, &path, &name);
+            p.duration = dur;
+            let tx = conn.transaction().unwrap();
+            upsert_video(&tx, &p, false).unwrap();
+            tx.commit().unwrap();
+            conn.execute(
+                "UPDATE videos SET rating = ?1 WHERE title = ?2",
+                params![rating, title],
+            )
+            .unwrap();
+        }
+        fn titles_of(items: Vec<VideoWithTags>) -> Vec<String> {
+            items.into_iter().map(|v| v.video.title).collect()
+        }
+        let conds: Vec<String> = vec![];
+        let boxed: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+        let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|p| p.as_ref()).collect();
+
+        // 评分降序：未评 Delta 沉底（v.rating = 0 首位），其余 10 > 8 > 6
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "rating", "desc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Bravo", "Charlie", "Alpha", "Delta"]);
+        // 评分升序：沉底逻辑不受方向影响
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "rating", "asc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Alpha", "Charlie", "Bravo", "Delta"]);
+
+        // 评分区间 [7, 9]：只留 Charlie（min/max 都生效）
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 7.0, 9.0, "rating", "desc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Charlie"]);
+
+        // 时长双向：Charlie 缺时长（IS NULL）无论方向都沉底
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "duration", "asc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Delta", "Alpha", "Bravo", "Charlie"]);
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "duration", "desc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Bravo", "Alpha", "Delta", "Charlie"]);
+
+        // 名称双向
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "name", "asc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Alpha", "Bravo", "Charlie", "Delta"]);
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "name", "desc").unwrap();
+        assert_eq!(titles_of(page.items), vec!["Delta", "Charlie", "Bravo", "Alpha"]);
+
+        // 未知 sort / order 值兜底到 last_watched 降序，不报错
+        let page = query_videos_paginated(&conn, &conds, &refs, 0, 60, 0.0, 10.0, "bogus", "bogus").unwrap();
+        assert_eq!(page.items.len(), 4);
+    }
+
     /// 回归：侧栏"新建标签"曾只 INSERT 不返回错误码——tags.name 是 UNIQUE，
     /// 重名时抛 "UNIQUE constraint failed"；而前端建完又不刷新列表，
     /// 两条叠加的表现就是"点了新建，什么都没发生"。
@@ -1399,6 +1726,36 @@ mod tests {
         assert!(create_tag(&conn, "   ", "#ff0000").is_err(), "空名应报错");
     }
 
+    /// 合体文件末集号能存能取（episode_end 列 + VIDEO_COLS 位序一并钉住）
+    #[test]
+    fn episode_end_roundtrip() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let sid = upsert_series(&tx, "合体剧", None).unwrap();
+        let p = VideoUpsertParams {
+            title: "合体剧.EP01-03",
+            file_path: "/t/合体剧.EP01-03.mkv",
+            file_name: "合体剧.EP01-03.mkv",
+            file_size: 1024,
+            duration: None,
+            kind: "series",
+            confidence: 90,
+            user_kind: None,
+            series_id: Some(sid),
+            season: Some(1),
+            episode: Some(1),
+            episode_end: Some(3),
+            default_watched: false,
+        };
+        upsert_video(&tx, &p, false).unwrap();
+        tx.commit().unwrap();
+
+        let list = get_series_episodes(&conn, sid).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].video.episode, Some(1));
+        assert_eq!(list[0].video.episode_end, Some(3), "末集号应能往返");
+    }
+
     /// 剧集进度 = 已看集数 / 总集数，与 watched_episodes 同源。
     /// 旧实现取 MAX(单集进度)：看 1/46 集就显示整剧 100%，与卡片上的"已看 1/46 集"自相矛盾。
     #[test]
@@ -1420,6 +1777,7 @@ mod tests {
                 series_id: Some(sid),
                 season: Some(1),
                 episode: Some(ep),
+                episode_end: None,
                 default_watched: false,
             };
             ids.push(upsert_video(&tx, &p, false).unwrap().id());
@@ -1445,6 +1803,230 @@ mod tests {
         // 全剧标记已看 → 100%（mark_series_watched 只改 watch_progress，也必须反映到已看集数）
         mark_series_watched(&conn, sid, true).unwrap();
         assert_eq!(ratio(&conn), (4, 4, 100.0), "全剧标记已看 → 4/4 且 100%");
+    }
+
+    #[test]
+    fn series_name_match_is_case_insensitive() {
+        let conn = mem_db();
+        let a = upsert_series(&conn, "The Boys", None).unwrap();
+        let b = upsert_series(&conn, "the boys", Some("H:\\TV\\The Boys")).unwrap();
+        assert_eq!(a, b, "大小写不同的剧集名应复用同一条记录");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM series", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// 合体文件按真实集数统计：EP01-03 一个文件 = 3 集，不能只算 1 集。
+    /// 同一个口径也要覆盖 mark_series_watched 的返回值（返回集数而非文件数）。
+    #[test]
+    fn merged_episode_ranges_count_as_episodes() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let sid = upsert_series(&tx, "合体统计剧", None).unwrap();
+        let p1 = VideoUpsertParams {
+            title: "合体统计剧.EP01-03",
+            file_path: "/t/合体统计剧.EP01-03.mkv",
+            file_name: "合体统计剧.EP01-03.mkv",
+            file_size: 300,
+            duration: Some(60.0),
+            kind: "series",
+            confidence: 90,
+            user_kind: None,
+            series_id: Some(sid),
+            season: Some(1),
+            episode: Some(1),
+            episode_end: Some(3),
+            default_watched: false,
+        };
+        let p2 = VideoUpsertParams {
+            title: "合体统计剧.EP04",
+            file_path: "/t/合体统计剧.EP04.mkv",
+            file_name: "合体统计剧.EP04.mkv",
+            file_size: 100,
+            duration: Some(30.0),
+            kind: "series",
+            confidence: 90,
+            user_kind: None,
+            series_id: Some(sid),
+            season: Some(1),
+            episode: Some(4),
+            episode_end: None,
+            default_watched: false,
+        };
+        let first = upsert_video(&tx, &p1, false).unwrap().id();
+        upsert_video(&tx, &p2, false).unwrap();
+        tx.commit().unwrap();
+
+        let overview = get_series_overview(&conn).unwrap();
+        let s = &overview[0];
+        assert_eq!(s.total_episodes, 4, "1 个三集合体 + 1 个单集 = 4 集");
+        assert_eq!(s.watched_episodes, 0);
+        assert!(s.cover_video_id.is_some(), "剧集封面应指向首个单集");
+
+        conn.execute(
+            "UPDATE videos SET watch_progress = 100 WHERE id = ?1",
+            params![first],
+        )
+        .unwrap();
+        let s = &get_series_overview(&conn).unwrap()[0];
+        assert_eq!(s.watched_episodes, 3);
+        assert_eq!(s.progress, 75.0, "看完三集合体文件应是 3/4 = 75%");
+
+        assert_eq!(
+            mark_series_watched(&conn, sid, true).unwrap(),
+            4,
+            "全剧标记返回集数而非文件数"
+        );
+    }
+
+    /// Windows 路径大小写不敏感：同一文件换种大小写扫描应更新原记录，不能插重复行。
+    #[test]
+    fn video_path_match_is_case_insensitive() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let a = upsert_video(&tx, &vp("A", r"H:\Movies\A.mkv", "A.mkv"), false)
+            .unwrap()
+            .id();
+        tx.commit().unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let b = upsert_video(
+            &tx,
+            &vp("A renamed", r"h:\movies\a.mkv", "A.mkv"),
+            true,
+        )
+        .unwrap()
+        .id();
+        tx.commit().unwrap();
+
+        assert_eq!(a, b, "同路径不同大小写必须命中同一条记录");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// 删除最后一集后空壳剧集不应继续出现在剧集列表。
+    #[test]
+    fn deleting_last_video_removes_empty_series() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        let sid = upsert_series(&tx, "空壳测试", None).unwrap();
+        let mut p = vp("唯一一集", "/t/空壳测试.E01.mkv", "空壳测试.E01.mkv");
+        p.kind = "series";
+        p.series_id = Some(sid);
+        p.episode = Some(1);
+        let vid = upsert_video(&tx, &p, false).unwrap().id();
+        tx.commit().unwrap();
+        assert_eq!(get_series_overview(&conn).unwrap().len(), 1);
+
+        delete_video(&conn, vid).unwrap();
+        assert!(get_series_overview(&conn).unwrap().is_empty());
+    }
+
+    /// 导入时剧集名/标签名按 NOCASE 关联，备份文件里的 "The Boys" 与
+    /// 视频上的 "the boys" 不能各建一套实体。
+    #[test]
+    fn import_matches_series_and_tags_case_insensitively() {
+        let conn = mem_db();
+        let tag = Tag {
+            id: 99,
+            name: "SciFi".into(),
+            color: "#6c9bff".into(),
+            video_count: None,
+        };
+        let video = Video {
+            id: 7,
+            title: "The Boys S01E01".into(),
+            file_path: "H:\\TV\\The.Boys.S01E01.mkv".into(),
+            file_name: "The.Boys.S01E01.mkv".into(),
+            file_size: 2_000_000_000,
+            duration: Some(3600.0),
+            rating: 9.0,
+            kind: "series".into(),
+            confidence: 95,
+            user_kind: None,
+            series_id: None,
+            series_name: Some("the boys".into()),
+            season: Some(1),
+            episode: Some(1),
+            episode_end: None,
+            last_watched_at: Some("2026-11-08 20:00:00".into()),
+            watch_progress: 25.0,
+            created_at: "2026-11-01 00:00:00".into(),
+            updated_at: "2026-11-08 20:00:00".into(),
+        };
+        let series = SeriesOverview {
+            id: 1,
+            name: "The Boys".into(),
+            folder_path: Some("H:\\TV\\The Boys".into()),
+            total_episodes: 1,
+            watched_episodes: 0,
+            progress: 25.0,
+            total_size: 2_000_000_000,
+            rating: 9.0,
+            last_watched_at: Some("2026-11-08 20:00:00".into()),
+            updated_at: "2026-11-08 20:00:00".into(),
+            total_duration: 3600.0,
+            cover_video_id: None,
+            tags: vec![tag.clone()],
+        };
+        let data = ExportData {
+            app: "cinevault".into(),
+            version: "1.0".into(),
+            exported_at: "2026-11-08 20:00:00".into(),
+            videos: vec![VideoWithTags {
+                video,
+                tags: vec![Tag { name: "scifi".into(), ..tag.clone() }],
+            }],
+            series: vec![series],
+            tags: vec![tag],
+            watch_history: Vec::new(),
+            scan_folders: Vec::new(),
+        };
+
+        let result = import_data(&conn, &data).unwrap();
+        assert_eq!(result.imported_videos, 1);
+        assert_eq!(result.imported_series, 1);
+        let overview = get_series_overview(&conn).unwrap();
+        assert_eq!(overview.len(), 1, "不应因大小写差异拆成两个剧集");
+        assert_eq!(overview[0].name, "The Boys");
+        assert_eq!(overview[0].tags.len(), 1, "标签也应大小写归并");
+        let episodes = get_series_episodes(&conn, overview[0].id).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].tags.len(), 1);
+    }
+
+    /// 导入前快照必须是可独立打开的完整 SQLite 库（VACUUM INTO，而不是复制主文件）。
+    #[test]
+    fn backup_database_can_be_opened_independently() {
+        let mut conn = mem_db();
+        let tx = conn.transaction().unwrap();
+        upsert_video(&tx, &vp("A", "/t/A.mkv", "A.mkv"), false).unwrap();
+        tx.commit().unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "cinevault-backup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = backup_database(&conn, &dir, "pre-import").unwrap();
+        assert!(std::path::Path::new(&path).is_file());
+
+        let backup = Connection::open(&path).unwrap();
+        let count: i64 = backup
+            .query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "快照必须包含当前数据");
+
+        drop(backup);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 最近观看按视频去重：同一部片子反复播放只出现一次，且带回完整视频数据。

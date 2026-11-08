@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ScanFolder, ScanResult } from "../types";
 import { api } from "../api";
 import { Modal, toast } from "./ui";
+import { Icon } from "./icons";
 
 export function ScanModal({
   onClose,
@@ -158,7 +159,7 @@ export function ScanModal({
                 }
               }}
             >
-              ✕
+              <Icon name="close" size={13} />
             </button>
           </div>
         ))}

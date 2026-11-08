@@ -1,5 +1,6 @@
-import React, { useState } from "react";
-import type { SeriesOverview, SortKey, Tag } from "../types";
+import { useState } from "react";
+import type { KeyboardEvent, MouseEvent } from "react";
+import type { SeriesOverview, SortSpec, Tag } from "../types";
 import { api } from "../api";
 import {
   ConfirmDialog,
@@ -9,9 +10,12 @@ import {
   Stars,
   TagChips,
   formatSize,
-  progressPct,
   toast,
 } from "./ui";
+import type { MenuItem } from "./ui";
+import { PosterArt, refreshPoster } from "./VideoCard";
+import { sortSeriesList } from "../lib/library";
+import { Icon } from "./icons";
 
 export function SeriesGrid({
   series,
@@ -21,7 +25,7 @@ export function SeriesGrid({
   onChanged,
 }: {
   series: SeriesOverview[];
-  sort: SortKey;
+  sort: SortSpec;
   onOpen: (s: SeriesOverview) => void;
   tags: Tag[];
   onChanged: () => void;
@@ -34,8 +38,11 @@ export function SeriesGrid({
   if (series.length === 0) {
     return (
       <div className="empty">
-        <div className="emoji">📺</div>
-        <p>还没有剧集</p>
+        <div className="empty-icon">
+          <Icon name="tv" size={28} />
+        </div>
+        <p>没有符合条件的剧集</p>
+        <span>换个关键词，或调整观看状态与评分范围</span>
       </div>
     );
   }
@@ -52,21 +59,37 @@ export function SeriesGrid({
     }
   };
 
-  const menuItems = (s: SeriesOverview) => [
-    { label: "▶ 打开剧集", onClick: () => onOpen(s) },
-    { label: "📁 打开所在文件夹", onClick: () => openFolder(s) },
+  const menuItems = (s: SeriesOverview): MenuItem[] => [
+    {
+      icon: <Icon name="play" size={14} />,
+      label: "打开剧集",
+      onClick: () => onOpen(s),
+    },
+    {
+      icon: <Icon name="folder" size={14} />,
+      label: "打开所在文件夹",
+      onClick: () => openFolder(s),
+    },
+    {
+      icon: <Icon name="refresh" size={14} />,
+      label: "刷新封面图",
+      onClick: () => void refreshPoster(s.cover_video_id),
+    },
     { sep: true },
-    { label: s.is_favorite ? "★ 取消收藏" : "☆ 收藏", onClick: async () => {
-        try {
-          await api.toggleSeriesFavorite(s.id);
-          onChanged();
-        } catch (e) {
-          toast.err(String(e));
-        }
-      } },
-    { label: "⭐ 评分…", onClick: () => setRatingItem(s) },
-    { label: "🏷 标签…", onClick: () => setTagItem(s) },
-    { label: "👁 全部标记为已看过", onClick: async () => {
+    {
+      icon: <Icon name="star" size={14} />,
+      label: "评分…",
+      onClick: () => setRatingItem(s),
+    },
+    {
+      icon: <Icon name="tag" size={14} />,
+      label: "标签…",
+      onClick: () => setTagItem(s),
+    },
+    {
+      icon: <Icon name="eye" size={14} />,
+      label: "全部标记为已看过",
+      onClick: async () => {
         try {
           const n = await api.markSeriesWatched(s.id, true);
           toast.ok(`已标记 ${n} 集`);
@@ -74,8 +97,12 @@ export function SeriesGrid({
         } catch (e) {
           toast.err(String(e));
         }
-      } },
-    { label: "👁 全部标记为未看过", onClick: async () => {
+      },
+    },
+    {
+      icon: <Icon name="eye-off" size={14} />,
+      label: "全部标记为未看过",
+      onClick: async () => {
         try {
           const n = await api.markSeriesWatched(s.id, false);
           toast.ok(`已标记 ${n} 集为未看过`);
@@ -83,68 +110,76 @@ export function SeriesGrid({
         } catch (e) {
           toast.err(String(e));
         }
-      } },
+      },
+    },
     { sep: true },
-    { label: "🗑 删除剧集（记录）", danger: true, onClick: () => setConfirmDel(s) },
+    {
+      icon: <Icon name="trash" size={14} />,
+      label: "删除剧集（记录）",
+      danger: true,
+      onClick: () => setConfirmDel(s),
+    },
   ];
 
-  // 顶栏排序：剧集全量在内存排序（updated_at 为 SQLite "YYYY-MM-DD HH:MM:SS"，字符串比较即时间序）
-  const sorted = [...series].sort((a, b) => {
-    switch (sort) {
-      case "updated":
-        return b.updated_at.localeCompare(a.updated_at);
-      case "last_watched":
-        return (b.last_watched_at ?? "").localeCompare(a.last_watched_at ?? "");
-      case "name":
-        return a.name.localeCompare(b.name, "zh-Hans-CN");
-      case "size":
-        return b.total_size - a.total_size;
-      case "rating":
-        return b.rating - a.rating;
-      default:
-        return 0;
-    }
-  });
+  const sorted = sortSeriesList(series, sort);
 
   return (
     <div>
       <div className="series-grid">
         {sorted.map((s) => {
-          const pct = progressPct(s.progress);
+          const pct = Math.max(0, Math.min(100, s.progress));
+          const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onOpen(s);
+            }
+          };
           return (
-            <div
+            <article
               key={s.id}
               className="series-card"
               onClick={() => onOpen(s)}
-              onContextMenu={(e) => {
+              onContextMenu={(e: MouseEvent) => {
                 e.preventDefault();
                 setMenu({ x: e.clientX, y: e.clientY, item: s });
               }}
+              onKeyDown={onKeyDown}
+              tabIndex={0}
+              role="button"
+              aria-label={`${s.name}，已看 ${s.watched_episodes}/${s.total_episodes} 集`}
             >
-              <div className="s-title">
-                {s.is_favorite && <span style={{ color: "var(--accent)", marginRight: 5 }}>★</span>}
-                {s.name}
-              </div>
-              <div className="s-meta">
-                <span>
-                  已看 {s.watched_episodes}/{s.total_episodes} 集
+              <PosterArt
+                videoId={s.cover_video_id}
+                title={s.name}
+                label="剧集"
+                kind="series"
+              >
+                <span className="poster-kind">
+                  <span className="series-count-badge">{s.total_episodes} 集</span>
                 </span>
-                <span>·</span>
-                <span>{formatSize(s.total_size)}</span>
-                <span style={{ marginLeft: "auto" }}>
+                {pct > 0 && (
+                  <div className={`poster-progress${pct >= 99.9 ? " done" : ""}`}>
+                    <span style={{ width: `${pct}%` }} />
+                  </div>
+                )}
+              </PosterArt>
+              <div className="series-body">
+                <div className="s-title">{s.name}</div>
+                <div className="s-meta">
+                  <span>
+                    已看 {s.watched_episodes}/{s.total_episodes} 集
+                  </span>
+                  <span className="meta-sep">·</span>
+                  <span>{formatSize(s.total_size)}</span>
+                </div>
+                <div className="s-foot">
                   <Stars rating={s.rating} />
-                </span>
+                  <div className="s-tags">
+                    <TagChips tags={s.tags} />
+                  </div>
+                </div>
               </div>
-              <div className="s-meta" style={{ marginTop: 4 }}>
-                <TagChips tags={s.tags} />
-              </div>
-              <div className="s-bar">
-                <div
-                  className={`s-bar-fill${pct >= 100 ? " done" : ""}`}
-                  style={{ width: `${pct}%` }}
-                />
-              </div>
-            </div>
+            </article>
           );
         })}
       </div>
@@ -198,7 +233,8 @@ export function SeriesGrid({
             {tags.map((t) => {
               const attached = (tagItem.tags ?? []).some((x) => x.id === t.id);
               return (
-                <span
+                <button
+                  type="button"
                   key={t.id}
                   className={`tag-pick${attached ? " on" : ""}`}
                   onClick={async () => {
@@ -216,7 +252,7 @@ export function SeriesGrid({
                 >
                   <span className="tag-dot" style={{ background: t.color }} />
                   {t.name}
-                </span>
+                </button>
               );
             })}
           </div>

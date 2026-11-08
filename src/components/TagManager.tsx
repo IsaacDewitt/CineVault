@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { Tag } from "../types";
 import { api } from "../api";
 import { ConfirmDialog, Modal, toast } from "./ui";
+import { Icon } from "./icons";
 
 export function TagManager({ onClose, onChanged }: { onClose: () => void; onChanged: () => void }) {
   const [tags, setTags] = useState<Tag[]>([]);
@@ -109,8 +110,9 @@ export function TagManager({ onClose, onChanged }: { onClose: () => void; onChan
               className="icon-btn"
               style={{ width: 24, height: 24, fontSize: 13 }}
               onClick={() => setConfirmDel(t)}
+              aria-label={`删除标签 ${t.name}`}
             >
-              🗑
+              <Icon name="trash" size={14} />
             </button>
           </div>
         ))}

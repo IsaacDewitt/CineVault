@@ -43,25 +43,110 @@ fn now_str() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 路径比较键：Windows 下 `/` 与 `\`、大小写都等价。
+/// 数据库里仍保留用户原始路径，只在内存判定时归一化。
+fn path_key(path: &str) -> String {
+    path.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+/// 扫描体积规则（可由用户在设置抽屉里改）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanConfig {
+    pub min_size_mb: i64,
+    pub exempt_prefixes: Vec<String>,
+}
+
+fn normalize_prefixes(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split([',', '，', '\n', '\r']) {
+        let p = part.trim();
+        if !p.is_empty() && !out.iter().any(|x| x == p) {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+fn load_scan_rules(conn: &rusqlite::Connection) -> ScanConfig {
+    let min_size_mb = crate::db::get_setting(conn, "scan_min_size_mb")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or((scanner::MIN_VIDEO_SIZE_BYTES / (1024 * 1024)) as i64)
+        .clamp(0, 10240);
+    let exempt_prefixes = match crate::db::get_setting(conn, "scan_size_exempt_prefixes")
+        .ok()
+        .flatten()
+    {
+        Some(raw) => normalize_prefixes(&raw),
+        None => scanner::SIZE_EXEMPT_PREFIXES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    };
+    ScanConfig { min_size_mb, exempt_prefixes }
+}
+
+fn scan_rules_bytes(rules: &ScanConfig) -> u64 {
+    (rules.min_size_mb.max(0) as u64) * 1024 * 1024
+}
+
+/// 文件是否落在任一可访问扫描根目录内（按目录边界，防 H:\剧误配 H:\剧集）。
+fn path_within_roots(file_path: &str, roots: &[String]) -> bool {
+    let fp = path_key(file_path);
+    let fp_bytes = fp.as_bytes();
+    roots.iter().any(|root| {
+        if root.is_empty() || fp.len() < root.len() || !fp_bytes.starts_with(root.as_bytes()) {
+            return false;
+        }
+        fp.len() == root.len()
+            || fp[root.len()..]
+                .chars()
+                .next()
+                .map_or(false, |c| c == '\\' || c == '/')
+    })
+}
+
 /// 分类结果 → 系列归属处理
 /// 0. 路径锚点认领：文件落在某已注册剧集（series.folder_path）目录树内 → 直接归该剧集，
 ///    不再走分类器（避免「添加剧集」建的剧集被刷新扫描拆散 / 新集被分类成别名剧集）
 /// 1. 分类器产出的剧集名 upsert（原名逻辑）
+///
+/// consensus_name：目录共识名（方案 A）。非 None 且分类器判定为 series 时优先采用，
+/// 覆盖分类器逐文件推断出的发布名。仅在「同目录多文件共享足够多词」时才有值，
+/// 是补上「分类器能判这堆文件是剧集、却判不出它们是同一个剧集」这一环。
+/// 方案 C 的收紧门槛：某剧集至少这么多集、且全部落在同一目录，才自动补 folder_path 锚点。
+/// 门槛不宜低：太低会把「碰巧同名」的零散记录锁成剧集；太高则新剧首次扫描收不到锚点。
+pub const MIN_ANCHOR_EPISODES: usize = 5;
+
 fn apply_series(
     tx: &rusqlite::Transaction,
     info: &scanner::VideoInfo,
     folder_anchors: &[(i64, String)],
+    consensus_name: Option<&str>,
 ) -> Result<Option<i64>, AppError> {
     if let Some(sid) = match_folder_anchor(&info.file_path, folder_anchors) {
         return Ok(Some(sid));
     }
     if info.kind == "series" {
-        if let Some(ref name) = info.series_name {
-            let name = name.trim();
-            if !name.is_empty() {
-                let sid = crate::db::upsert_series(tx, name, None)?;
-                return Ok(Some(sid));
+        // 方案 A：目录共识名优先于分类器的逐文件推断名
+        let name_owned;
+        let name = match consensus_name {
+            Some(n) if !n.trim().is_empty() => {
+                name_owned = n.trim().to_string();
+                &name_owned
             }
+            _ => match info.series_name.as_ref() {
+                Some(n) => n,
+                None => return Ok(None),
+            },
+        };
+        let name = name.trim();
+        if !name.is_empty() {
+            let sid = crate::db::upsert_series(tx, name, None)?;
+            return Ok(Some(sid));
         }
     }
     Ok(None)
@@ -118,6 +203,23 @@ fn load_folder_anchors(conn: &rusqlite::Connection) -> Result<Vec<(i64, String)>
     Ok(v)
 }
 
+/// 某目录下的视频归属几部剧集：1 = 独占（可安全写锚点），>1 = 共享（写锚点必串记录）。
+///
+/// 目录归一化与 `match_folder_anchor` 同源：只取到最后一个反斜杠为止，并保留尾部反斜杠。
+/// SQLite 的 `rtrim(X, Y)` 会删掉 X 尾部所有「出现在 Y 里的字符」，把 Y 取成
+/// 路径去掉全部反斜杠后的串，等价于「截到最后一个反斜杠」——纯表达式，无需应用侧再扫一遍全表。
+fn dir_series_owners(conn: &rusqlite::Connection, folder: &str) -> Result<i64, AppError> {
+    let dir_key = format!("{}\\", folder.trim_end_matches('\\'));
+    let owners: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT v.series_id) FROM videos v
+         WHERE v.series_id IS NOT NULL
+           AND rtrim(v.file_path, replace(v.file_path, '\\', '')) = ?1 COLLATE NOCASE",
+        rusqlite::params![dir_key],
+        |r| r.get(0),
+    )?;
+    Ok(owners)
+}
+
 // ============================================
 // 扫描
 // ============================================
@@ -130,15 +232,24 @@ pub async fn scan_folder(
     incremental: bool,
     default_watched: bool,
 ) -> Result<ScanResult, String> {
-    // 先扫描（不持 DB 锁，避免阻塞其他查询）
-    let (all_files, scan_errors) = scanner::scan_directory_reporting(&dir_path);
+    // 先取扫描规则（短锁），再扫描（不持 DB 锁，避免阻塞其他查询）
+    let rules = {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        load_scan_rules(&conn)
+    };
+    let (all_files, scan_errors) = scanner::scan_directory_reporting_with(
+        &dir_path,
+        scan_rules_bytes(&rules),
+        &rules.exempt_prefixes,
+    );
     let sibling_map = scanner::build_sibling_map_public(&all_files);
     let total_found = all_files.len() as i64;
+    // 方案 A：目录共识命名。扫完就把「同目录该叫什么」算好，
+    // 全程只跑一次（内部按目录分组 + 词频统计），不随文件数二次方增长。
+    let consensus_names = crate::consensus::directory_series_names(&all_files);
 
-    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    // 已注册剧集目录锚点（路径认领用）
-    let folder_anchors = load_folder_anchors(&conn)?;
     if total_found == 0 {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
         let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
         return Ok(ScanResult {
             total_found: 0,
@@ -149,9 +260,47 @@ pub async fn scan_folder(
         });
     }
 
-    // HashSet 加速已存在路径判定（避免全库线性查找）
-    let existing: std::collections::HashSet<String> =
-        crate::db::get_all_file_paths(&conn).map_err(|e| e.to_string())?.into_iter().collect();
+    // 数据库锁只覆盖两次短读写：读已有路径/锚点，和最后的批量写入。
+    // 文件元数据与容器头解析全部在锁外完成——网络盘上读文件头比 SQL 慢几个数量级。
+    let (existing, folder_anchors) = {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        // HashSet 加速已存在路径判定（避免全库线性查找）。
+        // 统一小写：Windows 路径大小写不敏感，否则同文件换个盘符大小写就会重复入库。
+        let existing: std::collections::HashSet<String> = crate::db::get_all_file_paths(&conn)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|p| path_key(&p))
+            .collect();
+        let anchors = load_folder_anchors(&conn)?;
+        (existing, anchors)
+    };
+
+    let mut prepared: Vec<(scanner::VideoInfo, Option<String>)> = Vec::new();
+    for file in &all_files {
+        let path_str = file.to_string_lossy().to_string();
+        if incremental && existing.contains(&path_key(&path_str)) {
+            continue;
+        }
+        let info = scanner::extract_video_info(file, &sibling_map);
+        let cname = file
+            .parent()
+            .and_then(|d| consensus_names.get(d))
+            .map(|s| s.to_string());
+        prepared.push((info, cname));
+    }
+
+    if prepared.is_empty() {
+        if let Ok(conn) = db.0.lock() {
+            let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
+        }
+        return Ok(ScanResult {
+            total_found,
+            new_added: 0,
+            updated: 0,
+            errors: scan_errors,
+            pending: Vec::new(),
+        });
+    }
 
     let mut new_added: i64 = 0;
     let mut updated: i64 = 0;
@@ -159,18 +308,13 @@ pub async fn scan_folder(
     let mut pending: Vec<PendingItem> = Vec::new();
 
     {
+        let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::db(e.to_string()))?;
 
-        for file in &all_files {
-            // 增量模式：已存在则跳过（但移动匹配需要检查路径变化 → 仍走 upsert 的移动匹配分支）
-            let path_str = file.to_string_lossy().to_string();
-            if incremental && existing.contains(&path_str) {
-                continue;
-            }
-            let info = scanner::extract_video_info(file, &sibling_map);
-            let series_id = apply_series(&tx, &info, &folder_anchors)?;
+        for (info, cname) in &prepared {
+            let series_id = apply_series(&tx, info, &folder_anchors, cname.as_deref())?;
             match crate::db::upsert_video(
                 &tx,
                 &VideoUpsertParams {
@@ -185,6 +329,7 @@ pub async fn scan_folder(
                     series_id,
                     season: info.season,
                     episode: info.episode,
+                    episode_end: info.episode_end,
                     default_watched,
                 },
                 true,
@@ -192,6 +337,9 @@ pub async fn scan_folder(
                 Ok(r) => {
                     if r.is_inserted() {
                         new_added += 1;
+                        if let Some(sid) = series_id {
+                            crate::db::touch_series(&tx, sid)?;
+                        }
                     } else {
                         updated += 1;
                     }
@@ -211,7 +359,9 @@ pub async fn scan_folder(
         tx.commit().map_err(|e| AppError::db(e.to_string()))?;
     }
 
-    let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
+    if let Ok(conn) = db.0.lock() {
+        let _ = crate::db::upsert_scan_folder(&conn, &dir_path);
+    }
 
     Ok(ScanResult {
         total_found,
@@ -244,8 +394,16 @@ pub async fn add_series_from_folder(
         return Err("文件夹名不能为空".to_string());
     }
 
-    // 先扫描（不持 DB 锁）
-    let (all_files, scan_errors) = scanner::scan_directory_reporting(&dir_path);
+    // 先取扫描规则（短锁），再扫描（不持 DB 锁）
+    let rules = {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        load_scan_rules(&conn)
+    };
+    let (all_files, scan_errors) = scanner::scan_directory_reporting_with(
+        &dir_path,
+        scan_rules_bytes(&rules),
+        &rules.exempt_prefixes,
+    );
     let total_found = all_files.len() as i64;
     if total_found == 0 {
         return Ok(ScanResult {
@@ -258,18 +416,22 @@ pub async fn add_series_from_folder(
     }
 
     let sibling_map = scanner::build_sibling_map_public(&all_files);
+    // 文件解析放在 DB 锁外，避免网络盘/机械盘读头阻塞其他查询。
+    let prepared: Vec<scanner::VideoInfo> = all_files
+        .iter()
+        .map(|file| scanner::extract_video_info(file, &sibling_map))
+        .collect();
     let mut new_added: i64 = 0;
     let mut updated: i64 = 0;
     let mut errors = scan_errors;
 
-    let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     {
+        let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
         let tx = conn.transaction().map_err(|e| AppError::db(e.to_string()))?;
         // 文件夹名 = 剧集名（同名并入），folder_path 记录完整路径
         let sid = crate::db::upsert_series(&tx, series_name, Some(&dir_path)).map_err(|e| e.to_string())?;
 
-        for file in &all_files {
-            let info = scanner::extract_video_info(file, &sibling_map);
+        for info in &prepared {
             // 强制归集：kind=series + user_kind=series（锁定防重判）+ series_id=本剧集
             match crate::db::upsert_video(
                 &tx,
@@ -285,6 +447,7 @@ pub async fn add_series_from_folder(
                     series_id: Some(sid),
                     season: info.season,
                     episode: info.episode,
+                    episode_end: info.episode_end,
                     default_watched,
                 },
                 true,
@@ -306,6 +469,9 @@ pub async fn add_series_from_folder(
                 Err(e) => errors.push(format!("{}: {}", info.file_path, e)),
             }
         }
+        if new_added > 0 {
+            crate::db::touch_series(&tx, sid)?;
+        }
         tx.commit().map_err(|e| AppError::db(e.to_string()))?;
     }
 
@@ -319,29 +485,70 @@ pub async fn add_series_from_folder(
 }
 
 #[tauri::command]
-pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> Result<RefreshResult, String> {
+pub async fn refresh_all_scans(
+    app: tauri::AppHandle,
+    db: State<'_, DbConn>,
+    default_watched: bool,
+) -> Result<RefreshResult, String> {
     // 短暂持锁读取订阅列表与现有路径，随即释放（扫描期间不占锁）
-    let (scan_folders, existing) = {
+    let (scan_folders, existing, rules) = {
         let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
         let _ = crate::db::set_setting(&conn, "last_refresh_at", &now_str());
         let folders = crate::db::get_scan_folders(&conn).map_err(|e| e.to_string())?;
-        let paths: std::collections::HashSet<String> =
-            crate::db::get_all_file_paths(&conn).map_err(|e| e.to_string())?.into_iter().collect();
-        (folders, paths)
+        let paths: std::collections::HashSet<String> = crate::db::get_all_file_paths(&conn)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|p| path_key(&p))
+            .collect();
+        let rules = load_scan_rules(&conn);
+        (folders, paths, rules)
     };
 
-    // 第一阶段：扫描所有订阅文件夹（不持锁）
+    // 第一阶段：扫描所有订阅文件夹（不持锁）。
+    // accessible_roots 是本次真正能访问的根目录；清理阶段只允许在这些根内删记录。
+    // 外接硬盘没插 / 网络盘掉线时，整个根不会被列入，已有评分与历史原样保留。
     let mut folder_jobs = Vec::new();
+    let mut accessible_roots: Vec<String> = Vec::new();
+    let mut queued_paths = existing.clone();
     let mut errors = Vec::new();
     for folder in &scan_folders {
-        let (all_files, scan_errors) = scanner::scan_directory_reporting(&folder.folder_path);
+        if !Path::new(&folder.folder_path).is_dir() {
+            errors.push(format!(
+                "[{}] 目录当前不可访问，已跳过扫描与清理",
+                folder.folder_path
+            ));
+            continue;
+        }
+        accessible_roots.push(path_key(&folder.folder_path));
+        let (all_files, scan_errors) = scanner::scan_directory_reporting_with(
+            &folder.folder_path,
+            scan_rules_bytes(&rules),
+            &rules.exempt_prefixes,
+        );
         for e in scan_errors {
             errors.push(format!("[{}] {}", folder.folder_path, e));
         }
         let sibling_map = scanner::build_sibling_map_public(&all_files);
-        folder_jobs.push((folder.folder_path.clone(), all_files, sibling_map));
+        // 方案 A：目录共识命名（每个订阅文件夹各算一次，扫完即算，不随文件数二次方增长）
+        let consensus_names = crate::consensus::directory_series_names(&all_files);
+        let mut prepared: Vec<(scanner::VideoInfo, Option<String>)> = Vec::new();
+        for file in &all_files {
+            let path_str = file.to_string_lossy().to_string();
+            // queued_paths 同时挡住“已入库”和“订阅根目录互相重叠”两种情况，
+            // 避免同一文件被两个根重复 upsert、moved 计数虚高。
+            if !queued_paths.insert(path_key(&path_str)) {
+                continue;
+            }
+            let info = scanner::extract_video_info(file, &sibling_map);
+            let cname = file
+                .parent()
+                .and_then(|d| consensus_names.get(d))
+                .map(|s| s.to_string());
+            prepared.push((info, cname));
+        }
+        folder_jobs.push((folder.folder_path.clone(), prepared));
     }
-    let folders_scanned = scan_folders.len() as i64;
+    let folders_scanned = folder_jobs.len() as i64;
 
     // 写库（重新持锁，锁范围只覆盖 DB 操作）
     let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
@@ -350,18 +557,13 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
     let mut new_added: i64 = 0;
     let mut moved: i64 = 0;
     let mut pending: Vec<PendingItem> = Vec::new();
-    for (folder_path, all_files, sibling_map) in &folder_jobs {
+    for (folder_path, prepared) in &folder_jobs {
         {
             let tx = conn
                 .transaction()
                 .map_err(|e| AppError::db(e.to_string()))?;
-            for file in all_files {
-                let path_str = file.to_string_lossy().to_string();
-                if existing.contains(&path_str) {
-                    continue;
-                }
-                let info = scanner::extract_video_info(file, sibling_map);
-                let series_id = apply_series(&tx, &info, &folder_anchors)?;
+            for (info, cname) in prepared {
+                let series_id = apply_series(&tx, info, &folder_anchors, cname.as_deref())?;
                 match crate::db::upsert_video(
                     &tx,
                     &VideoUpsertParams {
@@ -376,6 +578,7 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
                         series_id,
                         season: info.season,
                         episode: info.episode,
+                        episode_end: info.episode_end,
                         default_watched,
                     },
                     true,
@@ -383,6 +586,9 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
                     Ok(r) => {
                         if r.is_inserted() {
                             new_added += 1;
+                            if let Some(sid) = series_id {
+                                crate::db::touch_series(&tx, sid)?;
+                            }
                         } else {
                             moved += 1;
                         }
@@ -406,18 +612,110 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
         }
     }
 
-    // 第二阶段：清理磁盘上已不存在的记录 + 体积低于下限的小文件记录（豁免名单除外）。
-    // 扫描口（scan_directory_reporting）已挡住小文件入库，这里负责清掉历史存量，
-    // 并兜住"文件被替换成小体积版本"的情况。外键 ON DELETE CASCADE 自动清观看历史。
-    let mut removed: i64 = 0;
-    let videos: Vec<(i64, String, String, i64)> = {
+    // 第二阶段半（方案 C）：自动收紧目录锚点。
+    // 解决「先下载、后刷新扫描」的死结——「添加剧集」建的锚点能保后续，但保不了第一次：
+    // 用户先下载、第一次扫描时锚点还不存在，于是那批文件只能靠分类器起名。
+    // 这里在扫描写库后做一次收口：某剧集下 ≥ MIN_ANCHOR_EPISODES 集且全部落在
+    // 同一个目录树内 → 把该目录写进 series.folder_path，之后新集自带锚点、不再被拆散。
+    //
+    // 保守起见（守住「宁可拆散，不可串记录」）：
+    //   - 只处理 folder_path 为空的剧集（已有锚点的不动，避免覆盖用户手动设置）
+    //   - 所有集必须在同一目录（跨目录一律放弃，可能是多碟/多来源）
+    //   - 集数达标才收紧（防止把「碰巧同名」的零散记录锁成剧集）
+    let mut anchors_tightened: i64 = 0;
+    {
+        let candidates: Vec<(i64, String, i64)> = {
+            let mut out = Vec::new();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT se.id, se.name, COUNT(*) AS n,
+                            COUNT(DISTINCT rtrim(v.file_path, replace(v.file_path, '\\', ''))) AS dirs
+                     FROM series se
+                     JOIN videos v ON v.series_id = se.id
+                     WHERE se.folder_path IS NULL OR se.folder_path = ''
+                     GROUP BY se.id, se.name
+                     HAVING n >= ?1 AND dirs = 1",
+                )
+                .map_err(|e| AppError::db(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![MIN_ANCHOR_EPISODES as i64], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map_err(|e| AppError::db(e.to_string()))?;
+            for r in rows {
+                if let Ok(v) = r {
+                    out.push(v);
+                }
+            }
+            out
+        };
+
+        if !candidates.is_empty() {
+            let tx = conn.transaction().map_err(|e| AppError::db(e.to_string()))?;
+            for (sid, _name, _n) in &candidates {
+                // 取该剧集所有集文件所在目录（唯一），写进 folder_path
+                let dir: Option<String> = tx
+                    .query_row(
+                        "SELECT v.file_path FROM videos v WHERE v.series_id = ?1 LIMIT 1",
+                        rusqlite::params![sid],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| AppError::db(e.to_string()))?;
+                let Some(fp) = dir else { continue };
+                let folder = match fp.rfind('\\') {
+                    Some(i) if i > 0 => fp[..i].to_string(),
+                    _ => continue,
+                };
+                if folder.is_empty() {
+                    continue;
+                }
+                // 目录独占闸（2026-11-08 补）：同一目录若还挂着别的剧集，把目录写成锚点
+                // 会让两部剧共用同一个前缀，下次刷新时 match_folder_anchor 只能命中其中
+                // 一部（同长度先到先得，见该函数 `f.len() > *blen` 的严格比较），另一部的
+                // 集就被整体改判过去 —— 正是「宁可拆散，不可串记录」要防的事。
+                // 宁可放弃这次收紧（保持无锚点、继续靠分类器命名），也不能合并两剧。
+                let owners = dir_series_owners(&tx, &folder)?;
+                if owners > 1 {
+                    errors.push(format!(
+                        "已跳过锚点收紧（剧集 {}，{} 集）：目录 {} 同时归属 {} 部剧集",
+                        sid, _n, folder, owners
+                    ));
+                    continue;
+                }
+                if let Err(e) = tx.execute(
+                    "UPDATE series SET folder_path = ?1, updated_at = datetime('now','localtime') WHERE id = ?2",
+                    rusqlite::params![folder, sid],
+                ) {
+                    errors.push(format!("收紧锚点失败 (series {}): {}", sid, e));
+                } else {
+                    anchors_tightened += 1;
+                }
+            }
+            tx.commit().map_err(|e| AppError::db(e.to_string()))?;
+        }
+    }
+
+    // 第二阶段：只清理**本次可访问扫描根目录内**的失效记录。
+    // 关键安全边界：不在任何已订阅目录里的记录（手工添加的剧集、临时导入的备份）
+    // 永不在这里被删除；扫描根离线时整根跳过，绝不因为盘没插就把评分/历史清空。
+    // 体积判断用当前磁盘上的真实 metadata，而不是数据库里的旧 file_size，
+    // 这样“文件被替换成小体积版本”才真的能被发现。
+    //
+    // 先释放上一阶段持有的 DB 锁，再对全库做 metadata 探测；网络盘上几千次 stat
+    // 可能耗时数秒，绝不能把这串 IO 塞在数据库锁里。
+    drop(conn);
+    let videos: Vec<(i64, String, String)> = if accessible_roots.is_empty() {
+        Vec::new()
+    } else {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT id, file_path, file_name, file_size FROM videos")
+            .prepare("SELECT id, file_path, file_name FROM videos")
             .map_err(|e| AppError::db(e.to_string()))?;
         let mut out = Vec::new();
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|e| AppError::db(e.to_string()))?;
         for r in rows {
@@ -427,21 +725,75 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
         }
         out
     };
-    {
+
+    let mut to_remove: Vec<(i64, String)> = Vec::new();
+    for (id, file_path, file_name) in &videos {
+        if !path_within_roots(file_path, &accessible_roots) {
+            continue;
+        }
+        let should_remove = match std::fs::metadata(file_path) {
+            Ok(meta) => {
+                !meta.is_file()
+                    || (meta.len() < scan_rules_bytes(&rules)
+                        && !scanner::is_size_exempt_with(file_name, &rules.exempt_prefixes))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false, // 权限/IO 临时异常：宁可保留记录，也不误删
+        };
+        if should_remove {
+            to_remove.push((*id, file_path.clone()));
+        }
+    }
+
+    let mut removed: i64 = 0;
+    let mut removed_ids: Vec<i64> = Vec::new();
+    let mut backup_path: Option<String> = None;
+    if !to_remove.is_empty() {
+        let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        // 删除前整库快照：刷新扫描的“失效”判断依赖磁盘可见性，
+        // 万一判断错（外接盘短暂掉线、权限异常），用户还能从这份快照找回评分/历史。
+        match app.path().app_data_dir() {
+            Ok(dir) => {
+                match crate::db::backup_database(&conn, &dir, "pre-refresh") {
+                    Ok(path) => backup_path = Some(path),
+                    Err(e) => {
+                        errors.push(format!(
+                            "清理前备份失败，已跳过本轮删除（共 {} 条待清理）: {}",
+                            to_remove.len(),
+                            e
+                        ));
+                        to_remove.clear();
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("读取备份目录失败，已跳过本轮删除: {e}"));
+                to_remove.clear();
+            }
+        }
         let tx = conn
             .transaction()
             .map_err(|e| AppError::db(e.to_string()))?;
-        for (id, file_path, file_name, file_size) in &videos {
-            let too_small =
-                (*file_size as u64) < scanner::MIN_VIDEO_SIZE_BYTES && !scanner::is_size_exempt(file_name);
-            if !Path::new(file_path).exists() || too_small {
-                match tx.execute("DELETE FROM videos WHERE id = ?1", rusqlite::params![id]) {
-                    Ok(_) => removed += 1,
-                    Err(e) => errors.push(format!("删除记录失败 ({}): {}", file_path, e)),
+        for (id, file_path) in &to_remove {
+            match tx.execute("DELETE FROM videos WHERE id = ?1", rusqlite::params![id]) {
+                Ok(_) => {
+                    removed += 1;
+                    removed_ids.push(*id);
                 }
+                Err(e) => errors.push(format!("删除记录失败 ({}): {}", file_path, e)),
             }
         }
+        let _ = crate::db::delete_orphan_series(&tx);
         tx.commit().map_err(|e| AppError::db(e.to_string()))?;
+    }
+    // 缩略图缓存按 video_id 命名，记录删了图就成孤儿。放在锁外做文件 IO，
+    // 与 delete_video / delete_series 走同一条清理路径（否则刷新删档会一直漏）。
+    if !removed_ids.is_empty() {
+        crate::thumbnail::remove_cached_thumbnails(&app, &removed_ids);
+    }
+    // 兜底清理历史遗留空壳（即使本轮删除了 0 条，也顺手收口）
+    if let Ok(conn) = db.0.lock() {
+        let _ = crate::db::delete_orphan_series(&conn);
     }
 
     Ok(RefreshResult {
@@ -449,6 +801,8 @@ pub async fn refresh_all_scans(db: State<'_, DbConn>, default_watched: bool) -> 
         new_added,
         moved,
         folders_scanned,
+        anchors_tightened,
+        backup_path,
         errors,
         pending,
     })
@@ -465,19 +819,21 @@ pub fn get_videos(
     query: Option<String>,
     kind: Option<String>,
     tag_ids: Option<Vec<i64>>,
-    favorites_only: Option<bool>,
     min_rating: Option<f64>,
+    max_rating: Option<f64>,
     sort: Option<String>,
-    watch_status: Option<String>,
+    order: Option<String>,
+    watch_statuses: Option<Vec<String>>,
 ) -> Result<PaginatedVideos, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    let page = page.unwrap_or(0);
-    let page_size = page_size.unwrap_or(60);
+    // 本地 IPC 也可能被异常调用；负 LIMIT 在 SQLite 里等于“不限量”，必须兜住。
+    let page = page.unwrap_or(0).max(0);
+    let page_size = page_size.unwrap_or(60).clamp(1, 500);
     let min_rating = min_rating.unwrap_or(0.0);
+    let max_rating = max_rating.unwrap_or(10.0);
     let sort = sort.as_deref().unwrap_or("last_watched");
+    let order = order.as_deref().unwrap_or("desc");
     let kind = kind.filter(|k| !k.is_empty() && k != "all");
-    let favorites = favorites_only == Some(true);
-    let status = watch_status.as_deref().unwrap_or("all");
 
     // 统一拼装查询条件（含观看状态过滤）
     let mut conditions: Vec<String> = Vec::new();
@@ -512,9 +868,6 @@ pub fn get_videos(
         conditions.push(format!("v.kind = ?{}", idx));
         params.push(Box::new(k));
     }
-    if favorites {
-        conditions.push("v.is_favorite = 1".to_string());
-    }
     for tag_id in tag_ids.unwrap_or_default() {
         let idx = params.len() + 1;
         conditions.push(format!(
@@ -523,16 +876,33 @@ pub fn get_videos(
         ));
         params.push(Box::new(tag_id));
     }
-    match status {
-        "unwatched" => conditions.push("v.watch_progress = 0".to_string()),
-        "partial" => conditions.push("v.watch_progress > 0 AND v.watch_progress < 100".to_string()),
-        "watched" => conditions.push("v.watch_progress >= 100".to_string()),
-        _ => {}
+    // 观看状态多选：勾选集合即过滤集合（OR 连接）。
+    // None / 未传 = 不过滤（全选时前端不发该字段）；空集合 = 恒假（前端"全灭"态给空结果）。
+    // 状态值白名单化，字面量进 SQL，不引入绑定参数，不影响既有 ?N 编号。
+    if let Some(list) = watch_statuses {
+        let mut ors: Vec<&str> = Vec::new();
+        for s in &list {
+            match s.as_str() {
+                "unwatched" => ors.push("v.watch_progress = 0"),
+                // 与剧集统计/前端 watched() 同口径：99.9 起算“已看”，
+                // 避免 PotPlayer 算出 99.98% 时卡片显示已看、筛选却把它归到“在看”。
+                "partial" => ors.push("(v.watch_progress > 0 AND v.watch_progress < 99.9)"),
+                "watched" => ors.push("v.watch_progress >= 99.9"),
+                _ => {} // 未知值忽略
+            }
+        }
+        if ors.is_empty() {
+            conditions.push("1=0".to_string());
+        } else {
+            conditions.push(format!("({})", ors.join(" OR ")));
+        }
     }
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    crate::db::query_videos_paginated(&conn, &conditions, &param_refs, page, page_size, min_rating, sort)
-        .map_err(|e| e.to_string())
+    crate::db::query_videos_paginated(
+        &conn, &conditions, &param_refs, page, page_size, min_rating, max_rating, sort, order,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -545,8 +915,8 @@ pub fn get_recently_added(
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::get_recently_added_videos(
         &conn,
-        page.unwrap_or(0),
-        page_size.unwrap_or(60),
+        page.unwrap_or(0).max(0),
+        page_size.unwrap_or(60).clamp(1, 500),
         min_rating.unwrap_or(0.0),
     )
     .map_err(|e| e.to_string())
@@ -574,7 +944,8 @@ pub fn get_video_detail(db: State<'_, DbConn>, video_id: i64) -> Result<VideoWit
 #[tauri::command]
 pub fn get_history(db: State<'_, DbConn>, limit: Option<i64>) -> Result<Vec<HistoryEntry>, String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    crate::db::get_history_entries(&conn, limit.unwrap_or(60)).map_err(|e| e.to_string())
+    crate::db::get_history_entries(&conn, limit.unwrap_or(60).clamp(1, 500))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -660,30 +1031,6 @@ pub fn set_series_rating(db: State<'_, DbConn>, series_id: i64, rating: f64) -> 
     Ok(())
 }
 
-#[tauri::command]
-pub fn toggle_favorite(db: State<'_, DbConn>, video_id: i64) -> Result<bool, String> {
-    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    crate::db::toggle_favorite(&conn, video_id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn toggle_series_favorite(db: State<'_, DbConn>, series_id: i64) -> Result<bool, String> {
-    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    conn.execute(
-        "UPDATE series SET is_favorite = 1 - is_favorite, updated_at = datetime('now','localtime') WHERE id = ?1",
-        rusqlite::params![series_id],
-    )
-    .map_err(|e| AppError::db(e.to_string()))?;
-    let fav: i32 = conn
-        .query_row(
-            "SELECT is_favorite FROM series WHERE id = ?1",
-            rusqlite::params![series_id],
-            |r| r.get(0),
-        )
-        .map_err(|e| AppError::db(e.to_string()))?;
-    Ok(fav != 0)
-}
-
 /// 全剧标记已看/未看
 #[tauri::command]
 pub fn mark_series_watched(db: State<'_, DbConn>, series_id: i64, watched: bool) -> Result<i64, String> {
@@ -698,6 +1045,10 @@ pub fn mark_series_watched(db: State<'_, DbConn>, series_id: i64, watched: bool)
 /// 实测从 ~126 ms/次 降到 ~0.4 ms/次。
 #[tauri::command]
 pub fn update_progress(db: State<'_, DbConn>, video_id: i64, progress: f64) -> Result<(), String> {
+    if !progress.is_finite() {
+        return Err("观看进度必须是有限数值".to_string());
+    }
+    let progress = progress.clamp(0.0, 100.0);
     let mut conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     let tx = conn.transaction().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::update_watch_progress(&tx, video_id, progress).map_err(|e| e.to_string())?;
@@ -1282,10 +1633,13 @@ pub fn cancel_duration_backfill(cancel: State<'_, BackfillCancel>) -> Result<(),
 /// 走缓存版：首次调用后路径就固定在进程级 OnceLock 里，之后零开销，且与探测共用同一份结果。
 #[tauri::command]
 pub async fn get_ffprobe_status() -> FfprobeStatus {
-    match crate::media_info::resolve_ffprobe_cached() {
+    // 首次解析会真的起一次 `ffprobe -version`，不能在 async 运行时线程上同步等子进程。
+    tauri::async_runtime::spawn_blocking(|| match crate::media_info::resolve_ffprobe_cached() {
         Some(p) => FfprobeStatus { available: true, path: Some(p.to_string()) },
         None => FfprobeStatus { available: false, path: None },
-    }
+    })
+    .await
+    .unwrap_or(FfprobeStatus { available: false, path: None })
 }
 
 /// B-3：async + spawn_blocking，理由同 open_file——Shell 慢不堵主线程。
@@ -1320,37 +1674,77 @@ pub fn rename_series(db: State<'_, DbConn>, series_id: i64, new_name: String) ->
 }
 
 #[tauri::command]
-pub fn delete_video(db: State<'_, DbConn>, video_id: i64) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())
+pub fn delete_video(
+    app: tauri::AppHandle,
+    db: State<'_, DbConn>,
+    video_id: i64,
+) -> Result<(), String> {
+    {
+        // 锁只在删记录期间持有。缩略图清理是文件 IO，放到锁外做，
+        // 别让其他查询陪着等一次可能很慢的 unlink（杀毒软件扫描时尤其慢）。
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+    }
+    crate::thumbnail::remove_cached_thumbnail(&app, video_id);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn delete_series(db: State<'_, DbConn>, series_id: i64) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    crate::db::delete_series(&conn, series_id).map_err(|e| e.to_string())
+pub fn delete_series(
+    app: tauri::AppHandle,
+    db: State<'_, DbConn>,
+    series_id: i64,
+) -> Result<(), String> {
+    let video_ids = {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        // 先取 id 再删：DELETE 之后这批 id 就无从查起，而缓存的 jpg 正是按 id 命名。
+        let ids = crate::db::list_series_video_ids(&conn, series_id).map_err(|e| e.to_string())?;
+        crate::db::delete_series(&conn, series_id).map_err(|e| e.to_string())?;
+        ids
+    };
+    crate::thumbnail::remove_cached_thumbnails(&app, &video_ids);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn delete_video_with_file(db: State<'_, DbConn>, video_id: i64) -> Result<String, String> {
-    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
-    let file_path: String = conn
-        .query_row(
+pub async fn delete_video_with_file(
+    app: tauri::AppHandle,
+    db: State<'_, DbConn>,
+    video_id: i64,
+) -> Result<String, String> {
+    let file_path: String = {
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        conn.query_row(
             "SELECT file_path FROM videos WHERE id = ?1",
             rusqlite::params![video_id],
             |r| r.get(0),
         )
-        .map_err(|_| AppError::db("视频不存在"))?;
-    // 先删文件再删记录：文件删除失败时保留记录，评分/标签/进度不丢
-    match std::fs::remove_file(&file_path) {
+        .map_err(|_| AppError::db("视频不存在"))?
+    };
+    // 文件删除在 DB 锁外、blocking 线程上做：网络盘/大文件删除失败或变慢
+    // 都不该把整个界面卡住，也不能让其他查询陪着等。
+    let delete_path = file_path.clone();
+    let remove = tauri::async_runtime::spawn_blocking(move || std::fs::remove_file(delete_path))
+        .await
+        .map_err(|e| format!("文件删除任务异常: {e}"))?;
+    match remove {
         Ok(()) => {
-            crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+            {
+                let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+                crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+            }
+            crate::thumbnail::remove_cached_thumbnail(&app, video_id);
             Ok(format!("已删除文件: {}", file_path))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+            {
+                let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+                crate::db::delete_video(&conn, video_id).map_err(|e| e.to_string())?;
+            }
+            crate::thumbnail::remove_cached_thumbnail(&app, video_id);
             Ok(format!("记录已删除，文件不存在: {}", file_path))
         }
+        // 文件没删掉 = 记录保留 = 缓存也留着，下次打开还要用。
         Err(e) => Err(format!("文件删除失败，记录已保留: {}", e)),
     }
 }
@@ -1385,6 +1779,40 @@ pub fn get_scan_folders(db: State<'_, DbConn>) -> Result<Vec<ScanFolder>, String
 }
 
 #[tauri::command]
+pub fn get_scan_config(db: State<'_, DbConn>) -> Result<ScanConfig, String> {
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    Ok(load_scan_rules(&conn))
+}
+
+#[tauri::command]
+pub fn set_scan_config(
+    db: State<'_, DbConn>,
+    min_size_mb: i64,
+    exempt_prefixes: Vec<String>,
+) -> Result<ScanConfig, String> {
+    if !(0..=10240).contains(&min_size_mb) {
+        return Err("最小入库体积必须在 0–10240 MB 之间".to_string());
+    }
+    if exempt_prefixes.len() > 50 {
+        return Err("体积豁免前缀最多 50 条".to_string());
+    }
+    let normalized = normalize_prefixes(&exempt_prefixes.join(","));
+    if normalized.iter().any(|p| p.chars().count() > 64) {
+        return Err("单个豁免前缀不能超过 64 个字符".to_string());
+    }
+    let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+    crate::db::set_setting(&conn, "scan_min_size_mb", &min_size_mb.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::db::set_setting(
+        &conn,
+        "scan_size_exempt_prefixes",
+        &normalized.join(","),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ScanConfig { min_size_mb, exempt_prefixes: normalized })
+}
+
+#[tauri::command]
 pub fn delete_scan_folder(db: State<'_, DbConn>, folder_id: i64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
     crate::db::delete_scan_folder(&conn, folder_id).map_err(|e| e.to_string())
@@ -1412,6 +1840,21 @@ pub async fn migrate_from_old(db: State<'_, DbConn>, old_path: Option<String>) -
 // ============================================
 // 导出 / 导入
 // ============================================
+#[derive(serde::Serialize)]
+pub struct ExportFileResult {
+    pub path: String,
+    pub videos: i64,
+    pub series: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ImportFileResult {
+    #[serde(flatten)]
+    pub result: ImportResult,
+    /// 导入前自动生成的整库快照路径
+    pub backup_path: String,
+}
+
 /// B-1：async 化——导出要全库读出（5,078 视频 + 2,433 历史），同步版在主线程上
 /// 持锁做全部查询，大库时界面冻住。读库放 blocking 池，DB 锁只在读库期间持有。
 #[tauri::command]
@@ -1425,7 +1868,40 @@ pub async fn export_json(app: tauri::AppHandle) -> Result<ExportData, String> {
     .map_err(|e| format!("导出失败: {e}"))?
 }
 
+/// 主路径：后端直接写文件。大库 JSON 序列化/写盘全在 blocking 线程，
+/// 不再把几十 MB 数据经 IPC 搬到 WebView 主线程上 stringify。
+#[tauri::command]
+pub async fn export_json_to_file(
+    app: tauri::AppHandle,
+    file_path: String,
+) -> Result<ExportFileResult, String> {
+    if !file_path.to_lowercase().ends_with(".json") {
+        return Err("备份文件必须使用 .json 扩展名".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.state::<DbConn>();
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        let data = crate::db::export_data(&conn).map_err(|e| e.to_string())?;
+        let videos = data.videos.len() as i64;
+        let series = data.series.len() as i64;
+        let json = serde_json::to_string_pretty(&data)
+            .map_err(|e| format!("序列化备份失败: {e}"))?;
+        let p = Path::new(&file_path);
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建备份目录失败: {e}"))?;
+            }
+        }
+        std::fs::write(&file_path, json).map_err(|e| format!("写入备份失败: {e}"))?;
+        Ok(ExportFileResult { path: file_path, videos, series })
+    })
+    .await
+    .map_err(|e| format!("导出任务异常: {e}"))?
+}
+
 /// B-1：async 化，理由同 export_json——导入是批量写 + 全量校验，放 blocking 池。
+/// 该入口保留给旧前端/调试调用；正式 UI 走 import_json_from_file（自动备份 + 不搬大字符串）。
 #[tauri::command]
 pub async fn import_json(app: tauri::AppHandle, json_str: String) -> Result<ImportResult, String> {
     const MAX_IMPORT_SIZE: usize = 50_000_000;
@@ -1435,34 +1911,86 @@ pub async fn import_json(app: tauri::AppHandle, json_str: String) -> Result<Impo
     tauri::async_runtime::spawn_blocking(move || {
         let data: ExportData = serde_json::from_str(&json_str)
             .map_err(|e| AppError::validation(format!("JSON 解析失败: {}", e)))?;
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("读取应用数据目录失败: {e}"))?;
         let db = app.state::<DbConn>();
         let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        // 旧入口同样先整库快照，避免任何导入路径绕过安全闸。
+        crate::db::backup_database(&conn, &data_dir, "pre-import")
+            .map_err(|e| format!("导入前备份失败，已中止: {e}"))?;
         crate::db::import_data(&conn, &data).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("导入失败: {e}"))?
 }
 
-/// 读取文本文件（配合导入：前端选文件后读取内容；仅限 .json 备份）
+/// 正式导入路径：后端读文件/解析/整库备份/导入一气呵成。
+/// 返回自动备份路径，前端可以明确告诉用户“后悔药在哪”。
 #[tauri::command]
-pub fn read_text_file(file_path: String) -> Result<String, String> {
-    const MAX_JSON_SIZE: u64 = 50_000_000;
+pub async fn import_json_from_file(
+    app: tauri::AppHandle,
+    file_path: String,
+) -> Result<ImportFileResult, String> {
+    // 与导出保持一致：导出端不再限制大小，导入端也不能在 50MB 处把自家备份拒之门外。
+    // 512MB 已远超几万条视频 + 历史的 JSON 体积，读取仍在 blocking 线程完成。
+    const MAX_IMPORT_SIZE: u64 = 512 * 1024 * 1024;
     let p = Path::new(&file_path);
-    if !p.exists() || !p.is_file() {
-        return Err(format!("文件不存在: {}", file_path));
+    if !p.is_file() {
+        return Err(format!("备份文件不存在: {}", file_path));
     }
     if !file_path.to_lowercase().ends_with(".json") {
-        return Err("仅支持读取 .json 文件".to_string());
+        return Err("仅支持导入 .json 备份".to_string());
     }
-    if p.metadata().map(|m| m.len()).unwrap_or(0) > MAX_JSON_SIZE {
-        return Err("文件过大（超过 50MB）".to_string());
+    if p.metadata().map(|m| m.len()).unwrap_or(0) > MAX_IMPORT_SIZE {
+        return Err("备份文件超过 512MB，已拒绝导入".to_string());
     }
-    std::fs::read_to_string(&file_path).map_err(|e| format!("读取文件失败: {}", e))
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("读取备份失败: {e}"))?;
+        let data: ExportData = serde_json::from_str(&content)
+            .map_err(|e| format!("JSON 解析失败: {e}"))?;
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("读取应用数据目录失败: {e}"))?;
+        let db = app.state::<DbConn>();
+        let conn = db.0.lock().map_err(|e| AppError::db(e.to_string()))?;
+        let backup_path = crate::db::backup_database(&conn, &data_dir, "pre-import")
+            .map_err(|e| format!("导入前备份失败，已中止: {e}"))?;
+        let result = crate::db::import_data(&conn, &data).map_err(|e| e.to_string())?;
+        Ok(ImportFileResult { result, backup_path })
+    })
+    .await
+    .map_err(|e| format!("导入任务异常: {e}"))?
 }
 
-/// 写文本文件（配合导出：前端选保存位置后写入 JSON；仅限 .json）
+/// 读取文本文件（保留给调试/旧调用；仅限 .json 备份）。
+/// 50MB 文件读盘放到 blocking 池，绝不占用 WebView 主线程。
 #[tauri::command]
-pub fn write_text_file(file_path: String, content: String) -> Result<(), String> {
+pub async fn read_text_file(file_path: String) -> Result<String, String> {
+    const MAX_JSON_SIZE: u64 = 50_000_000;
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = Path::new(&file_path);
+        if !p.exists() || !p.is_file() {
+            return Err(format!("文件不存在: {}", file_path));
+        }
+        if !file_path.to_lowercase().ends_with(".json") {
+            return Err("仅支持读取 .json 文件".to_string());
+        }
+        if p.metadata().map(|m| m.len()).unwrap_or(0) > MAX_JSON_SIZE {
+            return Err("文件过大（超过 50MB）".to_string());
+        }
+        std::fs::read_to_string(&file_path).map_err(|e| format!("读取文件失败: {}", e))
+    })
+    .await
+    .map_err(|e| format!("读取任务异常: {e}"))?
+}
+
+/// 写文本文件（保留给调试/旧调用；仅限 .json）
+#[tauri::command]
+pub async fn write_text_file(file_path: String, content: String) -> Result<(), String> {
     const MAX_JSON_SIZE: usize = 50_000_000;
     if !file_path.to_lowercase().ends_with(".json") {
         return Err("仅支持写入 .json 文件".to_string());
@@ -1470,13 +1998,17 @@ pub fn write_text_file(file_path: String, content: String) -> Result<(), String>
     if content.len() > MAX_JSON_SIZE {
         return Err("内容过大（超过 50MB）".to_string());
     }
-    let p = Path::new(&file_path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = Path::new(&file_path);
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+            }
         }
-    }
-    std::fs::write(&file_path, content).map_err(|e| format!("写入文件失败: {}", e))
+        std::fs::write(&file_path, content).map_err(|e| format!("写入文件失败: {}", e))
+    })
+    .await
+    .map_err(|e| format!("写入任务异常: {e}"))?
 }
 
 // ============================================
@@ -1535,7 +2067,12 @@ pub fn get_drives() -> Result<Vec<DriveInfo>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::match_folder_anchor;
+    use super::{
+        apply_series, dir_series_owners, load_scan_rules, match_folder_anchor, path_key,
+        path_within_roots, scan_rules_bytes, MIN_ANCHOR_EPISODES,
+    };
+    use crate::scanner;
+    use std::collections::HashMap;
 
     fn anchors() -> Vec<(i64, String)> {
         // P-6 之后 match_folder_anchor 约定入参已归一化（load_folder_anchors 保证），
@@ -1596,5 +2133,388 @@ mod tests {
             match_folder_anchor("Z:\\电影\\Batman.2022.mkv", &a),
             None
         );
+    }
+
+    #[test]
+    fn cleanup_roots_are_case_insensitive_and_boundary_safe() {
+        let roots = vec![path_key("H:\\Movies")];
+        assert!(path_within_roots("h:\\movies\\A.mkv", &roots));
+        assert!(path_within_roots("H:/Movies/A.mkv", &roots));
+        assert!(!path_within_roots("H:\\Movies2\\A.mkv", &roots));
+        assert!(!path_within_roots("Z:\\Movies\\A.mkv", &roots));
+        // 盘根 H:\ 归一化成 h:，仍应按目录边界命中
+        let drive_root = vec![path_key("H:\\")];
+        assert!(path_within_roots("H:\\Movies\\A.mkv", &drive_root));
+    }
+
+    #[test]
+    fn cleanup_roots_empty_never_matches() {
+        assert!(!path_within_roots("H:\\Movies\\A.mkv", &[]));
+    }
+
+    #[test]
+    fn scan_rules_are_configurable_and_default_safe() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::initialize_database(&conn).unwrap();
+        let defaults = load_scan_rules(&conn);
+        assert_eq!(defaults.min_size_mb, 50);
+        assert!(defaults.exempt_prefixes.iter().any(|p| p == "Pingu"));
+        assert_eq!(scan_rules_bytes(&defaults), 50 * 1024 * 1024);
+
+        crate::db::set_setting(&conn, "scan_min_size_mb", "0").unwrap();
+        crate::db::set_setting(&conn, "scan_size_exempt_prefixes", "短片，Demo, 短片").unwrap();
+        let custom = load_scan_rules(&conn);
+        assert_eq!(custom.min_size_mb, 0);
+        assert_eq!(custom.exempt_prefixes, vec!["短片", "Demo"]);
+        assert_eq!(scan_rules_bytes(&custom), 0);
+    }
+
+    // ============================================
+    // 方案 A 端到端：目录共识命名必须把「一个文件夹」收敛成「一个剧集」
+    // 复现 2026-09-19「我与超人的冒险」事故的真实形态：
+    // 27 集分四种发布组标记（EDITH / NTb / HMAX / xingfan），
+    // 旧逻辑会按 clean_series_name 逐文件起名 → 拆成 7 个剧集。
+    // ============================================
+    fn superman_episode_paths() -> Vec<String> {
+        let d = "H:\\待看的剧\\我与超人冒险";
+        let mut v = Vec::new();
+        // S01E01~E10：NTb / EDITH 混排
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E01.Adventures.of.a.Normal.Man.Part.1.1080p.MAX.WEB-DL.DDP5.1.x264-NTb.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E02.Adventures.of.a.Normal.Man.Part.2.1080p.MAX.WEB-DL.DDP5.1.x264-NTb.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E03.1080p.WEB.h264-EDITH.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E04.1080p.WEB.h264-EDITH.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E05.You.Will.Believe.a.Man.Can.Lie.1080p.HMAX.WEB-DL.DD5.1.x264-NTb.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E06.1080p.WEB.h264-EDITH.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E07.1080p.WEB.h264-EDITH.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E08.Zero.Day.Part.1.1080p.HMAX.WEB-DL.DD5.1.x264-NTb.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E09.1080p.WEB.h264-EDITH.chs.eng.mp4", d));
+        v.push(format!("{}\\My.Adventures.with.Superman.S01E10.1080p.WEB.h264-EDITH[eztv.re].chs.eng.mp4", d));
+        // S02E01~E10：清一色 EDITH
+        for e in 1..=10 {
+            v.push(format!("{}\\My.Adventures.with.Superman.S02E{:02}.1080p.WEB.h264-EDITH.chs.eng.mp4", d, e));
+        }
+        // S03E01~E07：xingfan 站，带中文前缀
+        for e in 1..=7 {
+            v.push(format!("{}\\我与超人的冒险.My.Adventures.with.Superman.S03E{:02}.1080p.CHS&ENG.www.xingfan.cc.mp4", d, e));
+        }
+        v
+    }
+
+    /// 把路径列表转成 scanner::VideoInfo 需要的 sibling_map
+    fn sibling_map_of(paths: &[String]) -> HashMap<std::path::PathBuf, Vec<String>> {
+        let files: Vec<std::path::PathBuf> =
+            paths.iter().map(|s| std::path::PathBuf::from(s)).collect();
+        scanner::build_sibling_map_public(&files)
+    }
+
+    /// 方案 A 的算法正确性（绕过生产开关直测核心）。
+    /// 生产入口 directory_series_names 因 ENABLE_DIRECTORY_CONSENSUS=false 返回空表，
+    /// 这里验证「开关一旦打开，算法本身是对的」——避免开关开了才发现算法有洞。
+    #[test]
+    fn consensus_algorithm_is_correct_when_enabled() {
+        let paths = superman_episode_paths();
+        assert_eq!(paths.len(), 27, "样本应为 27 集");
+
+        let files: Vec<std::path::PathBuf> =
+            paths.iter().map(|s| std::path::PathBuf::from(s)).collect();
+        let names = crate::consensus::directory_series_names_ungated_for_test(&files);
+
+        let dir = std::path::PathBuf::from("H:\\待看的剧\\我与超人冒险");
+        let name = names.get(&dir).expect("该目录应产出共识名");
+
+        println!("共识剧集名 = {:?}", name);
+        // 发布组标记一个都不能进名字
+        for bad in ["edith", "ntb", "hmax", "xingfan", "www", "cc", "eztv", "1080p", "web", "ddp5"] {
+            assert!(!name.to_lowercase().contains(bad), "污染词 {} 进了名字: {}", bad, name);
+        }
+        let lower = name.to_lowercase();
+        assert!(lower.contains("superman"), "缺本体名: {}", name);
+        assert!(lower.contains("adventures"), "缺本体名: {}", name);
+    }
+
+    /// 生产入口在开关关闭时必须返回空表（= 行为与改动前完全一致，零风险）。
+    #[test]
+    fn consensus_entry_is_noop_when_disabled() {
+        let paths = superman_episode_paths();
+        let files: Vec<std::path::PathBuf> =
+            paths.iter().map(|s| std::path::PathBuf::from(s)).collect();
+        assert!(
+            crate::consensus::directory_series_names(&files).is_empty(),
+            "开关关闭时生产入口必须返回空表"
+        );
+    }
+
+    /// 事故复现 + 两条修复路线的效果对比（核心测试）。
+    ///
+    /// 断言分两段，把这个坑的真实形态钉死在测试里：
+    ///   ① 方案 A 关闭时（= 当前线上行为）：27 集被拆成 **7 个剧集**
+    ///      —— 正是 2026-09-19「我与超人的冒险」事故的数字，
+    ///      证明诊断准确、测试忠实建模，不是纸上推演
+    ///   ② 方案 A 临时开启：收敛为 1 个剧集（算法能力上限）
+    ///
+    /// 当前发布**只启用方案 C**（扫描后自动补 folder_path 锚点，不改名、不动已有剧集），
+    /// A 因广告水印污染风险暂缓（详见 consensus.rs 的 ENABLE_DIRECTORY_CONSENSUS 注释）。
+    #[test]
+    fn incident_reproduction_and_fix_paths() {
+        let paths = superman_episode_paths();
+        let anchors: Vec<(i64, String)> = Vec::new(); // 首次扫描：无任何锚点
+
+        // 跑一遍全目录，返回 (剧集数, 首个剧集名, 未归属数)
+        let run = |use_consensus: bool| -> (i64, String, i64) {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::db::initialize_database(&conn).unwrap();
+            let sib = sibling_map_of(&paths);
+            let files: Vec<std::path::PathBuf> =
+                paths.iter().map(|s| std::path::PathBuf::from(s)).collect();
+            let cnames = if use_consensus {
+                crate::consensus::directory_series_names_ungated_for_test(&files)
+            } else {
+                crate::consensus::directory_series_names(&files)
+            };
+
+            let tx = conn.unchecked_transaction().unwrap();
+            for p in &paths {
+                let path = std::path::Path::new(p);
+                let info = scanner::extract_video_info(path, &sib);
+                let cname = path.parent().and_then(|d| cnames.get(d)).map(|s| s.as_str());
+                let sid = apply_series(&tx, &info, &anchors, cname).unwrap();
+                tx.execute(
+                    "INSERT INTO videos (title, file_path, file_name, kind, series_id, season, episode)
+                     VALUES (?1, ?2, ?2, 'series', ?3, ?4, ?5)",
+                    rusqlite::params![info.title, p, sid, info.season, info.episode],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM series", [], |r| r.get(0)).unwrap();
+            let name: String = conn
+                .query_row("SELECT name FROM series ORDER BY id LIMIT 1", [], |r| r.get(0))
+                .unwrap();
+            let orphan: i64 = conn
+                .query_row("SELECT COUNT(*) FROM videos WHERE series_id IS NULL", [], |r| r.get(0))
+                .unwrap();
+            (n, name, orphan)
+        };
+
+        // ① 当前线上行为（A 关闭）：复现事故
+        let (n_off, name_off, orph_off) = run(false);
+        println!("[A 关闭/线上] 剧集数={} 未归属={} 首名={:?}", n_off, orph_off, name_off);
+        assert_eq!(n_off, 7, "应复现事故的 7 个剧集（实得 {}）", n_off);
+        assert_eq!(orph_off, 0, "即使拆散也不该有未归属");
+
+        // ② 开启 A：收敛（证明算法能力）
+        let (n_on, name_on, orph_on) = run(true);
+        println!("[A 开启] 剧集数={} 未归属={} 首名={:?}", n_on, orph_on, name_on);
+        assert_eq!(n_on, 1, "开启共识后应收敛为 1 个剧集（实得 {}）", n_on);
+        assert_eq!(orph_on, 0);
+        assert!(
+            !name_on.to_lowercase().contains("edith"),
+            "剧集名被发布组污染: {}",
+            name_on
+        );
+    }
+
+    /// 方案 C 的生产价值：把锚点收紧后再扫一遍，新集不再被拆散。
+    /// 这是当前发布真正生效的防线（A 关闭状态下依然成立）。
+    #[test]
+    fn anchor_tightening_prevents_future_splitting() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::initialize_database(&conn).unwrap();
+
+        // 模拟 A 关闭时首次扫描的结果：一个无锚点剧集，6 集同目录
+        conn.execute("INSERT INTO series (id, name, folder_path) VALUES (1, '待收紧剧集', NULL)", [])
+            .unwrap();
+        for e in 1..=6 {
+            conn.execute(
+                "INSERT INTO videos (title, file_path, file_name, kind, series_id, season, episode)
+                 VALUES (?1, ?2, ?2, 'series', 1, 1, ?3)",
+                rusqlite::params![
+                    format!("ep{}", e),
+                    format!("H:\\测试\\待收紧剧集\\ep{}.mp4", e),
+                    e
+                ],
+            )
+            .unwrap();
+        }
+
+        // 执行收紧（与 refresh_all_scans 内的逻辑同源）
+        let fp: String = conn
+            .query_row("SELECT file_path FROM videos WHERE series_id = 1 LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let folder = fp[..fp.rfind('\\').unwrap()].to_string();
+        conn.execute("UPDATE series SET folder_path = ?1 WHERE id = 1", rusqlite::params![folder])
+            .unwrap();
+
+        // 收紧后：新集命中锚点 → 直接归该剧集，不再走分类器起名
+        let anchors = vec![(1i64, "h:\\测试\\待收紧剧集".to_string())];
+        assert_eq!(
+            match_folder_anchor("H:\\测试\\待收紧剧集\\ep99.mkv", &anchors),
+            Some(1),
+            "收紧后新集应命中锚点，从而免疫拆散"
+        );
+    }
+
+    /// 方案 C：无锚点剧集在扫描后应被自动补上 folder_path。
+    /// 复现「先下载、后刷新」第一次扫描的收口动作。
+    #[test]
+    fn anchor_tightening_fills_missing_folder_path() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::initialize_database(&conn).unwrap();
+
+        // 造一个无锚点剧集 + 6 集（达标 MIN_ANCHOR_EPISODES），全部同目录
+        conn.execute(
+            "INSERT INTO series (id, name, folder_path) VALUES (1, '测试剧集', NULL)",
+            [],
+        )
+        .unwrap();
+        for e in 1..=6 {
+            conn.execute(
+                "INSERT INTO videos (title, file_path, file_name, kind, series_id, season, episode)
+                 VALUES (?1, ?2, ?2, 'series', 1, 1, ?3)",
+                rusqlite::params![
+                    format!("ep{}", e),
+                    format!("H:\\测试库\\测试剧集\\ep{}.mp4", e),
+                    e
+                ],
+            )
+            .unwrap();
+        }
+
+        // 复现收紧查询（与 refresh_all_scans 内的逻辑同源）
+        let cands: Vec<(i64, String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT se.id, se.name, COUNT(*) AS n,
+                            COUNT(DISTINCT rtrim(v.file_path, replace(v.file_path, '\\', ''))) AS dirs
+                     FROM series se
+                     JOIN videos v ON v.series_id = se.id
+                     WHERE se.folder_path IS NULL OR se.folder_path = ''
+                     GROUP BY se.id, se.name
+                     HAVING n >= ?1 AND dirs = 1",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![MIN_ANCHOR_EPISODES as i64], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })
+                .unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        assert_eq!(cands.len(), 1, "应识别出 1 个待收紧剧集，实得 {:?}", cands);
+
+        let fp: String = conn
+            .query_row("SELECT file_path FROM videos WHERE series_id = 1 LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let folder = fp[..fp.rfind('\\').unwrap()].to_string();
+        conn.execute(
+            "UPDATE series SET folder_path = ?1 WHERE id = 1",
+            rusqlite::params![folder],
+        )
+        .unwrap();
+
+        let got: Option<String> = conn
+            .query_row("SELECT folder_path FROM series WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("H:\\测试库\\测试剧集"));
+    }
+
+    /// 方案 C 的安全边界：跨目录的剧集不该被收紧（可能是多碟/多来源，硬锁会串记录）
+    #[test]
+    fn anchor_tightening_skips_multi_directory() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::initialize_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO series (id, name, folder_path) VALUES (1, '跨目录剧集', NULL)",
+            [],
+        )
+        .unwrap();
+        for (i, d) in ["H:\\盘A\\剧", "H:\\盘B\\剧", "H:\\盘C\\剧"].iter().enumerate() {
+            for e in 1..=2 {
+                conn.execute(
+                    "INSERT INTO videos (title, file_path, file_name, kind, series_id, season, episode)
+                     VALUES (?1, ?2, ?2, 'series', 1, 1, ?3)",
+                    rusqlite::params![
+                        format!("{}-{}", i, e),
+                        format!("{}\\ep{}.mp4", d, e),
+                        e
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT se.id FROM series se JOIN videos v ON v.series_id = se.id
+                    WHERE se.folder_path IS NULL OR se.folder_path = ''
+                    GROUP BY se.id HAVING COUNT(*) >= ?1
+                       AND COUNT(DISTINCT rtrim(v.file_path, replace(v.file_path, '\\', ''))) = 1
+                 )",
+                rusqlite::params![MIN_ANCHOR_EPISODES as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "跨目录剧集不该被收紧");
+    }
+
+    /// 同目录两剧：锚点收紧必须拒绝。
+    ///
+    /// 2026-11-08 实证事故形态：平铺目录下 A/B 各 5 集，两部都满足「≥5 集、单目录」，
+    /// 于是拿到同一个 folder_path；下次刷新时 match_folder_anchor 同长度先到先得，
+    /// B 的文件被整体改判给 A（实测 剧B 文件 → Some(剧A)），剧B 变空壳后被 delete_orphan_series 删掉。
+    /// 生产逻辑读这个计数 >1 时跳过收紧，此处钉住判据本身。
+    #[test]
+    fn anchor_tightening_refuses_shared_directory() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::initialize_database(&conn).unwrap();
+        for (id, name) in [(1, "剧A"), (2, "剧B"), (3, "剧C")] {
+            conn.execute(
+                "INSERT INTO series (id, name, folder_path) VALUES (?1, ?2, NULL)",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+        // 剧A / 剧B 各 5 集，同处一个平铺目录
+        for sid in [1, 2] {
+            for e in 1..=5 {
+                conn.execute(
+                    "INSERT INTO videos (title, file_path, file_name, kind, series_id, season, episode)
+                     VALUES (?1, ?2, ?2, 'series', ?3, 1, ?4)",
+                    rusqlite::params![
+                        format!("剧{}-{}", sid, e),
+                        format!("E:\\平铺目录\\S{}-E{}.mp4", sid, e),
+                        sid,
+                        e
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        // 剧C 独占另一个目录
+        for e in 1..=5 {
+            conn.execute(
+                "INSERT INTO videos (title, file_path, file_name, kind, series_id, season, episode)
+                 VALUES (?1, ?2, ?2, 'series', 3, 1, ?3)",
+                rusqlite::params![
+                    format!("剧C-{}", e),
+                    format!("E:\\独立目录\\C-E{}.mp4", e),
+                    e
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            dir_series_owners(&conn, "E:\\平铺目录").unwrap(),
+            2,
+            "平铺目录必须被识别为两剧共享"
+        );
+        assert_eq!(
+            dir_series_owners(&conn, "E:\\独立目录").unwrap(),
+            1,
+            "独占目录应放行收紧"
+        );
+        // 与 match_folder_anchor 同源：大小写与尾斜杠都不影响判定（Windows 路径语义）
+        assert_eq!(dir_series_owners(&conn, "e:\\平铺目录\\").unwrap(), 2);
     }
 }

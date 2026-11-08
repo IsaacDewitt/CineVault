@@ -1,4 +1,5 @@
 import React from "react";
+import { Icon } from "./icons";
 
 /**
  * 兜底错误边界：任一组件渲染抛异常时不至于整片白屏，至少给出提示与重载入口。
@@ -22,7 +23,9 @@ export class ErrorBoundary extends React.Component<
     if (this.state.message === null) return this.props.children;
     return (
       <div className="empty" style={{ padding: 60 }}>
-        <div className="emoji">⚠️</div>
+        <div className="empty-icon">
+          <Icon name="warning" size={28} />
+        </div>
         <p>界面出错了</p>
         <p
           style={{

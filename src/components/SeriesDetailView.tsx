@@ -1,11 +1,13 @@
-import React, { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { SeriesOverview, Tag, VideoWithTags } from "../types";
 import { api } from "../api";
 import { Modal, RatingPicker, Stars, TagChips, toast } from "./ui";
 import { VideoList } from "./VideoList";
+import { Icon } from "./icons";
 
 export function SeriesDetailView({
   series,
+  reloadKey,
   onBack,
   tags,
   onChanged,
@@ -13,6 +15,8 @@ export function SeriesDetailView({
   onPlayVideo,
 }: {
   series: SeriesOverview;
+  /** PotPlayer 进度同步成功后由 App 递增，触发集数列表重新拉取 */
+  reloadKey: number;
   onBack: () => void;
   tags: Tag[];
   onChanged: () => void;
@@ -25,6 +29,13 @@ export function SeriesDetailView({
   const [rating, setRating] = useState(series.rating);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [manageTags, setManageTags] = useState(false);
+  const ratingSavedRef = useRef(series.rating);
+
+  useEffect(() => {
+    ratingSavedRef.current = series.rating;
+    if (!editingName) setName(series.name);
+    setRating(series.rating);
+  }, [series.name, series.rating, editingName]);
 
   const load = useCallback(async () => {
     try {
@@ -36,15 +47,18 @@ export function SeriesDetailView({
 
   useEffect(() => {
     load();
-  }, [load]);
+  }, [load, reloadKey]);
 
   const attached = new Set((series.tags ?? []).map((t) => t.id));
 
   return (
     <div>
       <div className="breadcrumb">
-        <button onClick={onBack}>← 返回剧集</button>
-        <span style={{ color: "var(--text-3)" }}>/</span>
+        <button onClick={onBack}>
+          <Icon name="arrow-left" size={14} />
+          返回剧集
+        </button>
+        <span className="breadcrumb-sep">/</span>
         {editingName ? (
           <input
             className="input"
@@ -55,12 +69,17 @@ export function SeriesDetailView({
             onBlur={async () => {
               setEditingName(false);
               const n = name.trim();
-              if (n && n !== series.name) {
+              if (!n) {
+                setName(series.name);
+                return;
+              }
+              if (n !== series.name) {
                 try {
                   await api.renameSeries(series.id, n);
                   toast.ok("已改名");
                   onChanged();
                 } catch (e) {
+                  setName(series.name);
                   toast.err(String(e));
                 }
               }
@@ -74,7 +93,8 @@ export function SeriesDetailView({
             onClick={() => setEditingName(true)}
             title="点击改名"
           >
-            {series.name} ✏
+            {series.name}
+            <Icon name="edit" size={13} className="inline-edit-icon" />
           </span>
         )}
       </div>
@@ -89,11 +109,14 @@ export function SeriesDetailView({
         }}
       >
         <RatingPicker value={rating} onChange={async (r) => {
+          const previous = ratingSavedRef.current;
           setRating(r);
           try {
             await api.setSeriesRating(series.id, r);
+            ratingSavedRef.current = r;
             onChanged();
           } catch (e) {
+            setRating(previous);
             toast.err(String(e));
           }
         }} />
@@ -103,24 +126,13 @@ export function SeriesDetailView({
         </span>
         <TagChips tags={series.tags ?? []} />
         <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          <button
-            className="btn btn-ghost"
-            onClick={async () => {
-              try {
-                await api.toggleSeriesFavorite(series.id);
-                onChanged();
-              } catch (e) {
-                toast.err(String(e));
-              }
-            }}
-          >
-            {series.is_favorite ? "★ 取消收藏" : "☆ 收藏"}
-          </button>
           <button className="btn btn-ghost" onClick={() => setManageTags(true)}>
-            🏷 标签
+            <Icon name="tag" size={14} />
+            标签
           </button>
           {!confirmDelete ? (
             <button className="btn btn-danger" onClick={() => setConfirmDelete(true)}>
+              <Icon name="trash" size={14} />
               删除剧集
             </button>
           ) : (
@@ -148,13 +160,23 @@ export function SeriesDetailView({
         </span>
       </div>
 
-      <VideoList videos={episodes} onOpen={onOpenVideo} onPlay={onPlayVideo} onChanged={load} />
+      <VideoList
+        videos={episodes}
+        onOpen={onOpenVideo}
+        onPlay={onPlayVideo}
+        onChanged={() => {
+          // 集列表自己重拉；同时通知 App 刷新 series 聚合（已看集数/进度条/最近更新）。
+          void load();
+          onChanged();
+        }}
+      />
 
       {manageTags && (
         <Modal title={`为「${series.name}」选择标签`} onClose={() => setManageTags(false)}>
           <div className="tag-selector">
             {tags.map((t) => (
-              <span
+              <button
+                type="button"
                 key={t.id}
                 className={`tag-pick${attached.has(t.id) ? " on" : ""}`}
                 onClick={async () => {
@@ -172,7 +194,7 @@ export function SeriesDetailView({
               >
                 <span className="tag-dot" style={{ background: t.color }} />
                 {t.name}
-              </span>
+              </button>
             ))}
           </div>
         </Modal>

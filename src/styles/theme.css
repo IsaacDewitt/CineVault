@@ -42,6 +42,14 @@
 
   --font: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, -apple-system, sans-serif;
   --mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
+
+  /* 字号与节奏：卡片不再用 10.5px 的“像素罐头” */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 19px;
+  --fs-xl: 24px;
+  --content-pad: 26px;
 }
 
 * {
@@ -72,15 +80,15 @@ body {
 .size,
 .rating-num,
 .nav-badge,
-.tag-count,
-.stats-bar b {
+.tag-count {
   font-variant-numeric: tabular-nums;
 }
 
 /* 文件路径、输入框、详情值允许复制（排查文件问题时用得上） */
 .input,
 .detail-row .val,
-.v-sub {
+input,
+textarea {
   user-select: text;
   -webkit-user-select: text;
 }
@@ -310,6 +318,11 @@ select:focus-visible {
   border-bottom: 1px solid var(--border);
   background: rgba(17, 26, 43, 0.8);        /* 跟随 --bg-1 #111a2b */
   backdrop-filter: blur(10px);
+  /* backdrop-filter 使顶栏自成堆叠上下文（z 停在 0 级），而卡片行内容
+     z-index:1 在根层级反超 → 筛选弹层被列表行盖住。整体抬到内容层之上；
+     仍低于 Modal overlay(1000)/Toast(3000)/右键菜单(4000)。 */
+  position: relative;
+  z-index: 500;
 }
 .search-box {
   flex: 1;
@@ -348,41 +361,347 @@ select:focus-visible {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
-.select {
+/* 随机推荐这类视图：排序与筛选对结果无意义，隐藏（摆着按不动比不摆更误导） */
+.topbar-right.no-filters .fb-combo,
+.topbar-right.no-filters .fb-anchor {
+  display: none;
+}
+
+/* ============================================
+   顶栏筛选控件（fb-* = filter bar）
+   方案 B：排序组合控件 + 筛选漏斗弹层
+   ============================================ */
+.fb-combo {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.fb-selwrap {
+  position: relative;
+}
+.fb-selwrap::after {
+  content: "▾";
+  position: absolute;
+  right: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-3);
+  font-size: 10px;
+  pointer-events: none;
+}
+.fb-sel {
+  appearance: none;
+  -webkit-appearance: none;
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text-2);
-  padding: 6px 10px;
+  padding: 0 24px 0 10px;
   font-size: 12.5px;
   cursor: pointer;
   height: 34px;
+  font-family: var(--font);
 }
-.select:hover {
+.fb-sel:hover {
   border-color: var(--border-strong);
 }
-.select:focus {
+.fb-sel:focus {
   border-color: var(--accent);
 }
-
-/* ============================================
-   统计条
-   ============================================ */
-.stats-bar {
+.fb-dir {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  overflow: hidden;
+  height: 34px;
+}
+.fb-dir button {
+  flex: 1;
   display: flex;
   align-items: center;
-  gap: 20px;
-  padding: 9px 20px;
+  justify-content: center;
+  width: 24px;
+  padding: 0;
+  color: var(--text-3);
+  transition: background 0.12s, color 0.12s;
+}
+.fb-dir button:hover {
+  background: var(--bg-hover);
+}
+.fb-dir button.on {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+.fb-dir svg {
+  width: 11px;
+  height: 11px;
+}
+
+.fb-anchor {
+  position: relative;
+}
+.fb-funnel {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  transition: border-color 0.13s, color 0.13s;
+}
+.fb-funnel:hover {
+  border-color: var(--border-strong);
+}
+.fb-funnel.active {
+  border-color: rgba(240, 180, 41, 0.4);
+  color: var(--accent);
+}
+.fb-funnel svg {
+  width: 13px;
+  height: 13px;
+}
+.fb-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 弹层：低于 Modal overlay(1000)/Toast(3000)/右键菜单(4000) */
+.fb-pop {
+  position: absolute;
+  top: 44px;
+  right: 0;
+  width: 312px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+  z-index: 900;
+  animation: fbPopIn 0.14s ease;
+}
+@keyframes fbPopIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fb-pop-title {
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 1px;
+  margin-bottom: 9px;
+}
+.fb-pop-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.fb-pop-actions button {
   font-size: 12px;
   color: var(--text-3);
-  border-bottom: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 6px;
+  transition: color 0.12s, background 0.12s;
+}
+.fb-pop-actions button:hover {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+/* 观看状态三连勾选块：勾选集合即过滤集合，全亮 = 全部 */
+.fb-chips {
+  display: flex;
+  gap: 6px;
+}
+.fb-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-3);
+  font-size: 12.5px;
+  transition: border-color 0.13s, color 0.13s, background 0.13s;
+}
+.fb-chip:hover {
+  border-color: var(--border-strong);
+}
+.fb-chip.on {
+  background: var(--accent-dim);
+  border-color: rgba(240, 180, 41, 0.4);
+  color: var(--accent);
+}
+.fb-ck {
+  width: 13px;
+  height: 13px;
+  border-radius: 4px;
+  border: 1.5px solid var(--text-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: transparent;
+  transition: background 0.13s, border-color 0.13s, color 0.13s;
   flex-shrink: 0;
 }
-.stats-bar b {
-  color: var(--text-2);
-  font-weight: 600;
+.fb-chip.on .fb-ck {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* 评分双滑块：勾选启用，未启用整组压暗 */
+.fb-rating {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  transition: opacity 0.15s;
+}
+.fb-rating.off {
+  opacity: 0.48;
+}
+.fb-cbx {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  border: 1.5px solid var(--text-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.13s, border-color 0.13s;
+}
+.fb-cbx svg {
+  width: 9px;
+  height: 9px;
+  stroke: var(--accent-ink);
+  fill: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.fb-cbx.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.fb-cbx.on svg {
+  opacity: 1;
+}
+.fb-star {
+  font-size: 13px;
+  color: var(--text-3);
+  flex-shrink: 0;
+  transition: color 0.13s;
+}
+.fb-rating.on .fb-star {
+  color: var(--accent);
+}
+.fb-rlabel {
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  width: 74px;
+  text-align: center;
+  transition: color 0.13s;
+}
+.fb-rating.on .fb-rlabel {
+  color: var(--accent);
+}
+.fb-range {
+  position: relative;
+  width: 150px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+}
+.fb-range-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 4px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+  background: var(--bg-3);
+}
+/* 激活段在两把手之间（Material 3 range slider 规范） */
+.fb-range-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent-deep), var(--accent));
+}
+/* 双 input 叠放：track 穿透点击，只有 thumb 可拖 */
+.fb-range input[type="range"] {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 22px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+  margin: 0;
+  outline: none;
+}
+.fb-range input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2.5px solid var(--bg-2);
+  box-shadow: 0 0 0 1px var(--accent-deep);
+  cursor: grab;
+  transition: transform 0.12s;
+}
+.fb-range input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+.fb-range input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2.5px solid var(--bg-2);
+  box-shadow: 0 0 0 1px var(--accent-deep);
+  cursor: grab;
+}
+.fb-range input[type="range"]:disabled::-webkit-slider-thumb {
+  cursor: default;
+}
+.fb-range input[type="range"]:disabled::-moz-range-thumb {
+  cursor: default;
 }
 
 /* ============================================
@@ -435,81 +754,11 @@ select:focus-visible {
   font-weight: 400;
 }
 
-/* ============================================
-   视频列表（信息密度高的列表墙）
-   ============================================ */
-.video-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.video-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  background: var(--bg-1);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 10px 14px;
-  cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, transform 0.12s;
-  position: relative;
-  overflow: hidden;
-  /* B-6 渲染虚拟化（零依赖）：视口外的行跳过渲染与布局，"加载更多"滚到数百行
-     时滚动不再掉帧。contain-intrinsic-size 给未渲染行近似高度占位；
-     auto 关键字让浏览器记住渲染过的真实高度，滚动条不跳动。 */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 64px;
-}
-.video-row:hover {
-  background: var(--bg-2);
-  border-color: var(--border-strong);
-  box-shadow: inset 3px 0 0 var(--accent);   /* 左侧强调竖条，不位移 */
-}
-/* 观看进度 = 整行背景淡色填充 */
-.v-progress-bg {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  background: rgba(240, 180, 41, 0.10);      /* 进行中 = 琥珀 */
-  z-index: 0;
-  pointer-events: none;
-  transition: width 0.25s ease;
-}
-.v-progress-bg.active {
-  background: linear-gradient(90deg, rgba(240, 180, 41, 0.22), rgba(240, 180, 41, 0.08));
-}
-.v-progress-bg.done {
-  background: rgba(52, 211, 153, 0.18);      /* 已完成 = 绿（原蓝，避免与电影徽章撞色） */
-}
-.video-row > *:not(.v-progress-bg) {
-  position: relative;
-  z-index: 1;
-}
-.video-row .v-title {
-  flex: 1;
-  min-width: 0;
-  font-size: 13.5px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--text-1);
-}
-.video-row .v-sub {
-  font-size: 11.5px;
-  color: var(--text-3);
-  margin-top: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.video-row .v-meta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-shrink: 0;
+/* 网格列宽为兜底值，实际排版以 cards.css 为准（该文件在其后加载） */
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
 }
 
 /* 徽章 */
@@ -613,20 +862,14 @@ select:focus-visible {
   font-size: 11.5px;
   color: var(--text-3);
 }
-.series-card .s-bar {
-  height: 4px;
-  background: var(--bg-3);
-  border-radius: 2px;
-  margin-top: 10px;
-  overflow: hidden;
-}
-.series-card .s-bar-fill {
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
-  border-radius: 2px;
-}
-.series-card .s-bar-fill.done {
-  background: var(--green);    /* 已看完的剧集进度条 = 绿，与行内 .v-progress-bg.done 同口径 */
+/* 标签行（与 .s-meta 分开，便于详情/紧凑场景各自控制显隐） */
+.series-card .s-tags {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-3);
 }
 
 /* ============================================
@@ -778,6 +1021,197 @@ select:focus-visible {
 }
 .btn-danger:hover:not(:disabled) {
   background: rgba(248, 113, 113, 0.24);
+}
+
+/* ============================================
+   手机观看 / 局域网配对
+   ============================================ */
+.lan-loading {
+  color: var(--text-3);
+  padding: 28px 0;
+  text-align: center;
+}
+.lan-error {
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  color: var(--red);
+  border-radius: var(--r-md);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  font-size: 12.5px;
+}
+.lan-hero {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+  border-radius: var(--r-lg);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.lan-hero.on {
+  background: linear-gradient(135deg, rgba(52, 211, 153, 0.1), rgba(240, 180, 41, 0.06));
+  border-color: rgba(52, 211, 153, 0.24);
+}
+.lan-hero-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-3);
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.lan-hero-title {
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.lan-hero-sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.lan-switch {
+  width: 42px;
+  height: 24px;
+  border-radius: 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+  padding: 2px;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+}
+.lan-switch span {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition: transform 0.15s, background 0.15s;
+}
+.lan-switch.on {
+  background: rgba(52, 211, 153, 0.25);
+  border-color: rgba(52, 211, 153, 0.5);
+}
+.lan-switch.on span {
+  transform: translateX(18px);
+  background: var(--green);
+}
+.lan-warning {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: var(--r-sm);
+  padding: 9px 12px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+.lan-section-title {
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 1px;
+  margin: 16px 0 8px;
+  font-weight: 600;
+}
+.lan-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.lan-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  min-height: 44px;
+}
+.lan-row:last-child {
+  border-bottom: none;
+}
+.lan-label {
+  width: 70px;
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+.lan-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+.lan-pair {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 19px;
+  letter-spacing: 4px;
+  color: var(--accent);
+  font-weight: 700;
+  user-select: text;
+}
+.lan-token {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+.lan-copy {
+  padding: 4px 10px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.lan-steps {
+  margin: 14px 0 0;
+  padding-left: 20px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.9;
+}
+.lan-steps li::marker {
+  color: var(--accent);
+  font-weight: 700;
+}
+.lan-note {
+  background: var(--bg-1);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  padding: 10px 12px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.7;
+  margin-top: 14px;
+}
+.lan-note b {
+  color: var(--text-2);
+}
+.lan-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.lan-hint {
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 /* 表单 */
@@ -960,10 +1394,6 @@ select:focus-visible {
   padding: 80px 0;
   color: var(--text-3);
   gap: 10px;
-}
-.empty .emoji {
-  font-size: 42px;
-  opacity: 0.5;
 }
 .empty p {
   font-size: 13px;

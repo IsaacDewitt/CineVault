@@ -3,11 +3,14 @@
 
 mod classifier;
 mod commands;
+mod consensus;
 mod db;
+mod lan;
 mod media_info;
 mod migrator;
 mod models;
 mod scanner;
+mod thumbnail;
 
 use rusqlite::Connection;
 use std::fs;
@@ -18,6 +21,16 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 fn main() {
     tauri::Builder::default()
+        // 单实例保护：必须是第一个注册的插件（官方要求，抢在其余插件初始化前拦截）。
+        // Windows 下基于命名互斥体（app identifier）。第二实例启动即自动退出，
+        // 并把已有主窗口拉到前台——防止多实例并发共写同一 SQLite 库
+        // （SyncInFlight/BackfillCancel 是进程内标志，跨实例不生效）。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -50,6 +63,10 @@ fn main() {
             app.manage(db::DbConn::init(conn));
             app.manage(commands::BackfillCancel::default());
             app.manage(commands::SyncInFlight::default());
+            // 局域网只读服务：恢复上次开关状态。绑定失败不会 panic，UI 会显示具体错误。
+            app.manage(
+                lan::LanService::new(db_path.clone()).expect("failed to initialize LAN service"),
+            );
 
             // ===== 系统托盘 =====
             let show_item = MenuItemBuilder::with_id("show", "显示窗口").build(app)?;
@@ -141,8 +158,6 @@ fn main() {
             commands::remove_series_tag,
             commands::set_rating,
             commands::set_series_rating,
-            commands::toggle_favorite,
-            commands::toggle_series_favorite,
             commands::mark_series_watched,
             commands::update_progress,
             commands::mark_played,
@@ -161,13 +176,23 @@ fn main() {
             commands::resolve_pending,
             commands::get_scan_folders,
             commands::delete_scan_folder,
+            commands::get_scan_config,
+            commands::set_scan_config,
             commands::check_migration,
             commands::migrate_from_old,
             commands::export_json,
+            commands::export_json_to_file,
             commands::import_json,
+            commands::import_json_from_file,
             commands::read_text_file,
             commands::write_text_file,
+            thumbnail::get_video_thumbnail,
+            thumbnail::refresh_video_thumbnail,
             commands::get_drives,
+            lan::get_lan_status,
+            lan::set_lan_enabled,
+            lan::regenerate_lan_token,
+            lan::rotate_lan_pair_code,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,341 @@
+/* ============================================
+   侧栏底部 / 设置抽屉
+   ============================================ */
+
+.sidebar {
+  width: 236px;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.sidebar-settings {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 11px;
+  border-radius: 9px;
+  border: 1px solid rgba(240, 180, 41, 0.16);
+  background: linear-gradient(
+    135deg,
+    rgba(240, 180, 41, 0.12),
+    rgba(240, 180, 41, 0.035)
+  );
+  color: var(--accent);
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.sidebar-settings:hover {
+  background: rgba(240, 180, 41, 0.16);
+  border-color: rgba(240, 180, 41, 0.3);
+}
+
+.sidebar-settings-hint {
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 9.5px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.nav-pending {
+  color: var(--accent);
+}
+
+.nav-pending .nav-badge {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.tag-create {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+}
+
+.tag-create .input {
+  min-width: 0;
+  height: 30px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.tag-create-btn {
+  height: 30px;
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+.tag-add {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font);
+}
+
+/* ---------- 抽屉 ---------- */
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 850;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(5, 8, 14, 0.58);
+  backdrop-filter: blur(3px);
+  animation: drawerFadeIn 0.15s ease;
+}
+
+.settings-drawer {
+  width: 392px;
+  max-width: calc(100vw - 48px);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-1);
+  border-left: 1px solid var(--border-strong);
+  box-shadow: -22px 0 54px rgba(0, 0, 0, 0.38);
+  animation: drawerSlideIn 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.settings-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 22px 18px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.settings-kicker {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+
+.settings-header h2 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 750;
+  letter-spacing: -0.025em;
+}
+
+.settings-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 18px 34px;
+}
+
+.settings-section {
+  padding: 16px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-section:last-of-type {
+  border-bottom: none;
+}
+
+.settings-section h3 {
+  margin: 0 0 8px;
+  padding: 0 6px;
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.35px;
+  text-transform: uppercase;
+}
+
+.settings-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 8px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-1);
+  font-family: var(--font);
+  text-align: left;
+  transition: background 0.13s ease, border-color 0.13s ease;
+}
+
+.settings-row:hover:not(:disabled) {
+  background: var(--bg-2);
+  border-color: var(--border);
+}
+
+.settings-row:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.settings-row-icon {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.settings-row:hover:not(:disabled) .settings-row-icon {
+  color: var(--accent);
+  border-color: rgba(240, 180, 41, 0.2);
+}
+
+.settings-row-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.settings-row-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.settings-row-desc {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.45;
+}
+
+.settings-row-chevron {
+  color: var(--text-3);
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 6px 12px;
+}
+
+.settings-field label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-field .input {
+  height: 34px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+}
+
+.settings-field > span {
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.settings-save-btn {
+  margin: 0 6px;
+  padding: 5px 11px;
+  font-size: 11.5px;
+}
+
+.settings-progress {
+  margin: 2px 6px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-2);
+}
+
+.settings-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-progress-track {
+  height: 4px;
+  margin-top: 9px;
+  border-radius: 2px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.settings-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent-deep), var(--accent));
+  transition: width 0.2s ease;
+}
+
+.settings-progress-meta {
+  margin-top: 7px;
+  color: var(--text-3);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-inline-btn {
+  margin-top: 10px;
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.settings-footnote {
+  margin: 18px 6px 0;
+  padding: 12px 13px;
+  border-left: 2px solid rgba(240, 180, 41, 0.45);
+  border-radius: 0 8px 8px 0;
+  background: var(--bg-2);
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+@keyframes drawerFadeIn {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes drawerSlideIn {
+  from {
+    transform: translateX(24px);
+    opacity: 0.6;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 900px) {
+  .settings-drawer {
+    width: 100%;
+    max-width: none;
+  }
+}

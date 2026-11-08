@@ -59,7 +59,6 @@ pub struct Video {
     pub file_size: i64,
     pub duration: Option<f64>,
     pub rating: f64,
-    pub is_favorite: bool,
     /// movie / series / unknown
     pub kind: String,
     /// 自动分类置信度 0-100
@@ -70,6 +69,9 @@ pub struct Video {
     pub series_name: Option<String>,
     pub season: Option<i32>,
     pub episode: Option<i32>,
+    /// 合体文件（一个文件含多集）的末集号；单集为 null
+    #[serde(default)]
+    pub episode_end: Option<i32>,
     pub last_watched_at: Option<String>,
     pub watch_progress: f64,
     pub created_at: String,
@@ -102,11 +104,16 @@ pub struct SeriesOverview {
     pub progress: f64,
     pub total_size: i64,
     pub rating: f64,
-    pub is_favorite: bool,
     pub last_watched_at: Option<String>,
     /// 旧备份 JSON 无此字段，缺省空串以兼容导入
     #[serde(default)]
     pub updated_at: String,
+    /// 全部单集时长之和（秒）。旧备份 JSON 无此字段，缺省 0 以兼容导入。
+    #[serde(default)]
+    pub total_duration: f64,
+    /// 用于剧集卡片封面的首个单集 id。旧备份无此字段，缺省 None。
+    #[serde(default)]
+    pub cover_video_id: Option<i64>,
     pub tags: Vec<Tag>,
 }
 
@@ -155,6 +162,12 @@ pub struct RefreshResult {
     pub new_added: i64,
     pub moved: i64,
     pub folders_scanned: i64,
+    /// 本次自动收紧锚点的剧集数（方案 C：为无锚点剧集补 folder_path）
+    #[serde(default)]
+    pub anchors_tightened: i64,
+    /// 本轮发生删除前自动生成的整库快照路径；无删除时为 None。
+    #[serde(default)]
+    pub backup_path: Option<String>,
     pub errors: Vec<String>,
     pub pending: Vec<PendingItem>,
 }
@@ -173,7 +186,6 @@ pub struct VideoStats {
     pub total_videos: i64,
     pub total_series: i64,
     pub total_size: i64,
-    pub favorites_count: i64,
     pub watched_count: i64,
     pub average_rating: f64,
     pub movie_count: i64,
@@ -210,6 +222,7 @@ pub struct VideoUpsertParams<'a> {
     pub series_id: Option<i64>,
     pub season: Option<i32>,
     pub episode: Option<i32>,
+    pub episode_end: Option<i32>,
     pub default_watched: bool,
 }
 

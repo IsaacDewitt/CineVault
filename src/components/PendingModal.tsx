@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { PendingItem } from "../types";
 import { api } from "../api";
 import { Modal, toast } from "./ui";
+import { Icon } from "./icons";
 
 export function PendingModal({
   onClose,
@@ -65,7 +66,9 @@ export function PendingModal({
       </p>
       {items.length === 0 ? (
         <div className="empty" style={{ padding: 40 }}>
-          <div className="emoji">✅</div>
+          <div className="empty-icon">
+            <Icon name="check" size={28} />
+          </div>
           <p>没有待确认项</p>
         </div>
       ) : (

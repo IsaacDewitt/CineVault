@@ -72,7 +72,7 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
     let mut series_count = 0i64;
     if table_exists(&old, "series") {
         let mut stmt = old
-            .prepare("SELECT id, name, folder_path, rating, is_favorite, last_watched_at, watch_progress FROM series")
+            .prepare("SELECT id, name, folder_path, rating, last_watched_at, watch_progress FROM series")
             .map_err(|e| AppError::db(e.to_string()))?;
         let rows = stmt
             .query_map([], |r| {
@@ -81,19 +81,18 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, f64>(3)?,
-                    r.get::<_, i32>(4)? != 0,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, f64>(6)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, f64>(5)?,
                 ))
             })
             .map_err(|e| AppError::db(e.to_string()))?;
         for r in rows {
-            if let Ok((old_id, name, folder, rating, fav, last_watched, progress)) = r {
+            if let Ok((old_id, name, folder, rating, last_watched, progress)) = r {
                 tx.execute(
-                    "INSERT INTO series (name, folder_path, rating, is_favorite, last_watched_at, watch_progress)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "INSERT INTO series (name, folder_path, rating, last_watched_at, watch_progress)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(name) DO NOTHING",
-                    params![name, folder, rating, if fav { 1 } else { 0 }, last_watched, progress],
+                    params![name, folder, rating, last_watched, progress],
                 )?;
                 let new_id: i64 = tx.query_row(
                     "SELECT id FROM series WHERE name = ?1",
@@ -116,7 +115,7 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
         let has_kind = table_has_column(&old, "videos", "kind");
         let has_user_kind = table_has_column(&old, "videos", "user_kind");
 
-        let mut cols = "id, title, file_path, file_name, file_size, duration, rating, is_favorite, video_type, season, episode, last_watched_at, watch_progress, updated_at".to_string();
+        let mut cols = "id, title, file_path, file_name, file_size, duration, rating, video_type, season, episode, last_watched_at, watch_progress, updated_at".to_string();
         if has_series_id {
             cols.push_str(", series_id");
         }
@@ -141,7 +140,6 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
                 let file_size: i64 = r.get(idx)?; idx += 1;
                 let duration: Option<f64> = r.get(idx)?; idx += 1;
                 let rating: f64 = r.get(idx)?; idx += 1;
-                let is_favorite: i32 = r.get(idx)?; idx += 1;
                 let video_type: String = r.get(idx)?; idx += 1;
                 let season: Option<i32> = r.get(idx)?; idx += 1;
                 let episode: Option<i32> = r.get(idx)?; idx += 1;
@@ -152,12 +150,12 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
                 let old_series_name: Option<String> = if has_series_name { let v = r.get(idx)?; idx += 1; v } else { None };
                 let old_kind: Option<String> = if has_kind { let v = r.get(idx)?; idx += 1; v } else { None };
                 let old_user_kind: Option<String> = if has_user_kind { r.get(idx)? } else { None };
-                Ok((id, title, file_path, file_name, file_size, duration, rating, is_favorite, video_type, season, episode, last_watched_at, watch_progress, updated_at, old_series_id, old_series_name, old_kind, old_user_kind))
+                Ok((id, title, file_path, file_name, file_size, duration, rating, video_type, season, episode, last_watched_at, watch_progress, updated_at, old_series_id, old_series_name, old_kind, old_user_kind))
             })
             .map_err(|e| AppError::db(e.to_string()))?;
 
         for r in rows {
-            if let Ok((old_id, title, file_path, file_name, file_size, duration, rating, is_fav,
+            if let Ok((old_id, title, file_path, file_name, file_size, duration, rating,
                        video_type, season, episode, last_watched_at, watch_progress, updated_at,
                        old_series_id, old_series_name, old_kind, old_user_kind)) = r {
                 // kind 映射
@@ -182,9 +180,9 @@ pub fn migrate(conn: &Connection, old_path: &str) -> Result<MigrationResult, App
                     None
                 };
                 tx.execute(
-                    "INSERT OR IGNORE INTO videos (title, file_path, file_name, file_size, duration, rating, is_favorite, kind, confidence, user_kind, series_id, season, episode, last_watched_at, watch_progress, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, COALESCE(?16, datetime('now','localtime')), COALESCE(?17, datetime('now','localtime')))",
-                    params![title, file_path, file_name, file_size, duration, rating, if is_fav != 0 { 1 } else { 0 },
+                    "INSERT OR IGNORE INTO videos (title, file_path, file_name, file_size, duration, rating, kind, confidence, user_kind, series_id, season, episode, last_watched_at, watch_progress, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, COALESCE(?15, datetime('now','localtime')), COALESCE(?16, datetime('now','localtime')))",
+                    params![title, file_path, file_name, file_size, duration, rating,
                             kind, confidence, old_user_kind, new_series_id, season, episode, last_watched_at, watch_progress,
                             updated_at.as_deref().map(|s| if s.is_empty() { None } else { Some(s) }).flatten(),
                             updated_at.as_deref().map(|s| if s.is_empty() { None } else { Some(s) }).flatten()],

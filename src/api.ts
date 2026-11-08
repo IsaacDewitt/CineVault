@@ -3,14 +3,17 @@ import type {
   BackfillProgress,
   BackfillResult,
   ExportData,
+  ExportFileResult,
   FfprobeStatus,
   ImportResult,
   PaginatedVideos,
   PendingItem,
   RefreshResult,
+  ScanConfig,
   ScanFolder,
   ScanResult,
   HistoryEntry,
+  LanStatus,
   SeriesOverview,
   Tag,
   VideoKind,
@@ -38,21 +41,26 @@ export const api = {
     query?: string;
     kind?: string;
     tagIds?: number[];
-    favoritesOnly?: boolean;
+    /** 评分区间下限；0 = 不看下限。启用与否由调用方决定（未启用传 0） */
     minRating?: number;
+    /** 评分区间上限；不传/10 = 不看上限 */
+    maxRating?: number;
     sort?: string;
-    watchStatus?: string;
+    order?: string;
+    /** 观看状态勾选集合；全选时不传（= 不过滤），空数组 = 恒假（空结果） */
+    watchStatuses?: string[];
   }) =>
     invoke<PaginatedVideos>("get_videos", {
       page: p.page ?? 0,
       pageSize: p.pageSize ?? 60,
       query: p.query ?? "",
-      kind: p.kind ?? "all",
+      kind: p.kind,
       tagIds: p.tagIds ?? [],
-      favoritesOnly: p.favoritesOnly ?? false,
       minRating: p.minRating ?? 0,
+      maxRating: p.maxRating,
       sort: p.sort ?? "last_watched",
-      watchStatus: p.watchStatus ?? "all",
+      order: p.order ?? "desc",
+      watchStatuses: p.watchStatuses,
     }),
   getRecentlyAdded: (page = 0, pageSize = 60) =>
     invoke<PaginatedVideos>("get_recently_added", { page, pageSize }),
@@ -85,10 +93,6 @@ export const api = {
     invoke("set_rating", { videoId, rating }),
   setSeriesRating: (seriesId: number, rating: number) =>
     invoke("set_series_rating", { seriesId, rating }),
-  toggleFavorite: (videoId: number) =>
-    invoke<boolean>("toggle_favorite", { videoId }),
-  toggleSeriesFavorite: (seriesId: number) =>
-    invoke<boolean>("toggle_series_favorite", { seriesId }),
   markSeriesWatched: (seriesId: number, watched: boolean) =>
     invoke<number>("mark_series_watched", { seriesId, watched }),
   updateProgress: (videoId: number, progress: number) =>
@@ -115,13 +119,27 @@ export const api = {
   getScanFolders: () => invoke<ScanFolder[]>("get_scan_folders"),
   deleteScanFolder: (folderId: number) =>
     invoke("delete_scan_folder", { folderId }),
+  getScanConfig: () => invoke<ScanConfig>("get_scan_config"),
+  setScanConfig: (minSizeMb: number, exemptPrefixes: string[]) =>
+    invoke<ScanConfig>("set_scan_config", { minSizeMb, exemptPrefixes }),
 
   // 导出 / 导入
   exportJson: () => invoke<ExportData>("export_json"),
+  exportJsonToFile: (filePath: string) =>
+    invoke<ExportFileResult>("export_json_to_file", { filePath }),
   importJson: (jsonStr: string) => invoke<ImportResult>("import_json", { jsonStr }),
+  importJsonFromFile: (filePath: string) =>
+    invoke<ImportResult>("import_json_from_file", { filePath }),
   readTextFile: (filePath: string) => invoke<string>("read_text_file", { filePath }),
   writeTextFile: (filePath: string, content: string) =>
     invoke("write_text_file", { filePath, content }),
+
+  // 本地静帧（无 ffmpeg / 解码失败时返回 null，由前端画文字片头卡）
+  getVideoThumbnail: (videoId: number) =>
+    invoke<string | null>("get_video_thumbnail", { videoId }),
+  // 刷新封面：后端删掉旧 jpg 并在随机位置重新抽一帧；返回 null = 旧图已删但没生成成功
+  refreshVideoThumbnail: (videoId: number) =>
+    invoke<string | null>("refresh_video_thumbnail", { videoId }),
 
   // 时长补全
   backfillDurations: () => invoke<BackfillResult>("backfill_durations"),
@@ -130,6 +148,13 @@ export const api = {
 
   // 系统
   getDrives: () => invoke<{ letter: string; path: string; label: string }[]>("get_drives"),
+
+  // 局域网手机访问
+  getLanStatus: () => invoke<LanStatus>("get_lan_status"),
+  setLanEnabled: (enabled: boolean) =>
+    invoke<LanStatus>("set_lan_enabled", { enabled }),
+  regenerateLanToken: () => invoke<LanStatus>("regenerate_lan_token"),
+  rotateLanPairCode: () => invoke<LanStatus>("rotate_lan_pair_code"),
 };
 
 // 事件负载类型（backfill-progress）仅此一处引用，单独导出避免被当未使用

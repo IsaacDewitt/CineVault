@@ -8,11 +8,12 @@ use std::sync::LazyLock;
 
 const SEP: &str = r"[\s._\-\[\]()（）【】]";
 
-/// 强信号：季+集（S01E01 / Season 1 Episode 2 / 第1季第2集）
+/// 强信号：季+集（S01E01 / Season 1 Episode 2 / 第1季第2集），可选集号区间（S09E23-24）
+/// 分组：1=季 2=集 3=区间末集 4=中文季 5=中文集
 static SEASON_EPISODE_RE: LazyLock<Regex> = LazyLock::new(|| {
     let p = format!(
         r"(?ix)(?:^|{sep})
-        (?:S(?:eason)?\s*(\d{{1,2}})\s*(?:EP?|Episode)\s*(\d{{1,3}})
+        (?:S(?:eason)?\s*(\d{{1,2}})\s*(?:EP?|Episode)\s*(\d{{1,3}})(?:\s*[-–~]\s*(\d{{1,3}}))?
         |第\s*(\d{{1,2}})\s*季\s*第?\s*(\d{{1,3}})\s*集)
         (?:{sep}|$)",
         sep = SEP
@@ -20,14 +21,25 @@ static SEASON_EPISODE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&p).unwrap()
 });
 
-/// 单集信号：EP01 / Episode 2 / 第3集
+/// 单集信号：EP01 / Episode 2 / 第3集，可选集号区间（EP01-03 / 第31-32集）
+/// 分组：1=集 2=区间末集
 static EPISODE_RE: LazyLock<Regex> = LazyLock::new(|| {
     let p = format!(
-        r"(?ix)(?:^|{sep})(?:EP|Episode|第)\s*(\d{{1,3}})(?:集|{sep}|$)",
+        r"(?ix)(?:^|{sep})(?:EP|Episode|第)\s*(\d{{1,3}})(?:\s*[-–~]\s*(\d{{1,3}}))?(?:集|{sep}|$)",
         sep = SEP
     );
     Regex::new(&p).unwrap()
 });
+
+/// 区间末集合理性：必须大于起始集、跨度不超过 20 集、小于 1000。
+/// 拦住 `EP01-1080p` 这类把分辨率/年份吃进区间末位的误判（正则已要求其后是分隔符，
+/// 这里再兜一层，防止 `EP01-03v2` 这种变体）。
+fn sane_end(start: Option<i32>, end: Option<i32>) -> Option<i32> {
+    match (start, end) {
+        (Some(s), Some(e)) if e > s && e - s <= 20 && e < 1000 => Some(e),
+        _ => None,
+    }
+}
 
 /// 数字序号信号：xxx.01.mkv / 武林外传40.rmvb（1-3 位纯数字）
 /// 注意：regex crate 不支持 lookbehind，前字符校验在代码里做（is_numeric_ep 排除 x264/1080p 等）
@@ -88,17 +100,24 @@ pub struct Classification {
     pub series_name: Option<String>,
     pub season: Option<i32>,
     pub episode: Option<i32>,
+    /// 合体文件（一个文件含多集，如 EP01-03）的末集号；单集文件为 None
+    pub episode_end: Option<i32>,
 }
 
 impl Classification {
     fn movie(confidence: i32) -> Self {
-        Self { kind: "movie".into(), confidence, series_name: None, season: None, episode: None }
+        Self { kind: "movie".into(), confidence, series_name: None, season: None, episode: None, episode_end: None }
     }
     fn unknown(confidence: i32, series_name: Option<String>, season: Option<i32>, episode: Option<i32>) -> Self {
-        Self { kind: "unknown".into(), confidence, series_name, season, episode }
+        Self { kind: "unknown".into(), confidence, series_name, season, episode, episode_end: None }
     }
     fn series(confidence: i32, series_name: Option<String>, season: Option<i32>, episode: Option<i32>) -> Self {
-        Self { kind: "series".into(), confidence, series_name, season, episode }
+        Self { kind: "series".into(), confidence, series_name, season, episode, episode_end: None }
+    }
+    /// 补上合体文件的末集号（链式调用，避免改动所有构造点）
+    fn with_end(mut self, episode_end: Option<i32>) -> Self {
+        self.episode_end = episode_end;
+        self
     }
 }
 
@@ -110,14 +129,18 @@ impl Classification {
 pub fn classify(title: &str, parent_name: &str, grandparent_name: Option<&str>, sibling_titles: &[String]) -> Classification {
     // ===== 第一层：文件名规则 =====
     if let Some(caps) = SEASON_EPISODE_RE.captures(title) {
-        let season = caps.get(1).or_else(|| caps.get(3)).and_then(|m| m.as_str().parse().ok());
-        let episode = caps.get(2).or_else(|| caps.get(4)).and_then(|m| m.as_str().parse().ok());
+        let season = caps.get(1).or_else(|| caps.get(4)).and_then(|m| m.as_str().parse().ok());
+        let episode = caps.get(2).or_else(|| caps.get(5)).and_then(|m| m.as_str().parse().ok());
+        let episode_end = caps.get(3).and_then(|m| m.as_str().parse::<i32>().ok());
         let name = clean_series_name(title);
-        return Classification::series(92, Some(name), season, episode);
+        return Classification::series(92, Some(name), season, episode)
+            .with_end(sane_end(episode, episode_end));
     }
 
-    // 单集信号
-    let episode = EPISODE_RE.captures(title).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse::<i32>().ok());
+    // 单集信号（含 EP01-03 这类合体区间）
+    let ep_caps = EPISODE_RE.captures(title);
+    let episode = ep_caps.as_ref().and_then(|c| c.get(1)).and_then(|m| m.as_str().parse::<i32>().ok());
+    let episode_end = ep_caps.as_ref().and_then(|c| c.get(2)).and_then(|m| m.as_str().parse::<i32>().ok());
     // 数字序号信号（排除 1080/720 等分辨率、4k、年份、x264 前缀）
     let numeric_ep = numeric_episode(title);
 
@@ -200,10 +223,12 @@ pub fn classify(title: &str, parent_name: &str, grandparent_name: Option<&str>, 
     }
 
     // ===== 输出 =====
+    let ep = episode.or(numeric_ep);
+    let end = sane_end(ep, episode_end);
     if score >= 55 {
-        Classification::series(score.min(90), series_name, season, episode.or(numeric_ep))
+        Classification::series(score.min(90), series_name, season, ep).with_end(end)
     } else if score >= 25 {
-        Classification::unknown(score, series_name, season, episode.or(numeric_ep))
+        Classification::unknown(score, series_name, season, ep).with_end(end)
     } else {
         Classification::movie((100 - score.min(100)).max(50))
     }
@@ -332,5 +357,62 @@ mod tests {
         // 3 个共享前缀的目录文件，含数字序号 → 可能剧集，待确认（siblings 含自身）
         let c = t("random.ep.01", "misc", &["random.ep.01", "random.ep.02", "random.ep.03"]);
         assert!(c.kind == "series" || c.kind == "unknown", "got kind={}", c.kind);
+    }
+
+    /// 合体文件：Friends.S09E23-24 → 起始 23、末集 24，剧集名不被 "-24" 污染
+    #[test]
+    fn season_episode_range() {
+        let c = t("Friends.S09E23-24.2002.BluRay.720p.x264.AC3-CMCT", "老友记.第九季.2002", &[]);
+        assert_eq!(c.season, Some(9));
+        assert_eq!(c.episode, Some(23));
+        assert_eq!(c.episode_end, Some(24), "末集应识别为 24");
+        let name = c.series_name.unwrap_or_default();
+        assert!(!name.contains("-24"), "剧集名不该带 -24，实际={name}");
+    }
+
+    /// 合体文件（无季号）：征服.2003.EP01-03 → 1~3（同目录 7 个合体文件，按真实场景给同级）
+    #[test]
+    fn episode_range_without_season() {
+        let sibs: Vec<String> = ["EP01-03", "EP04-06", "EP07-09", "EP10-12", "EP13-15", "EP16-18", "EP19-20"]
+            .iter().map(|s| format!("征服.2003.{s}.HD1080P.国语中字")).collect();
+        let c = classify("征服.2003.EP01-03.HD1080P.国语中字", "征服.2003.全20集", None, &sibs);
+        // 该剧实测是 unknown（年份 -10 分），靠后续人工/共识归入剧集；这里只钉集号解析
+        assert_ne!(c.kind, "movie");
+        assert_eq!(c.episode, Some(1));
+        assert_eq!(c.episode_end, Some(3), "EP01-03 应识别为 1~3");
+    }
+
+    /// 中文合体写法：第31-32集
+    #[test]
+    fn chinese_range() {
+        let sibs: Vec<String> = ["第29-30集", "第31-32集", "第33-34集", "第35-36集", "第37-38集", "第39-40集"]
+            .iter().map(|s| format!("某剧.第二季[{s}].2025")).collect();
+        let c = classify("某剧.第二季[第31-32集].2025", "某剧", None, &sibs);
+        assert_eq!(c.kind, "series");
+        assert_eq!(c.episode, Some(31));
+        assert_eq!(c.episode_end, Some(32));
+    }
+
+    /// 区间不得把分辨率/码率吃进末集位（直接校验正则分组，避免受置信度影响）
+    #[test]
+    fn range_does_not_eat_resolution() {
+        let caps = EPISODE_RE.captures("Show.EP01-1080p").expect("应匹配 EP01");
+        assert_eq!(caps.get(1).unwrap().as_str(), "01");
+        assert!(caps.get(2).is_none(), "1080p 不是集号");
+
+        let caps = EPISODE_RE.captures("Show.EP01-02v2.1080p").expect("应匹配 EP01");
+        assert_eq!(caps.get(1).unwrap().as_str(), "01");
+        assert!(caps.get(2).is_none(), "02v2 之后不是分隔符，不算区间");
+
+        // 跨度离谱的也不认
+        assert_eq!(sane_end(Some(1), Some(900)), None);
+    }
+
+    /// 普通单集不受影响
+    #[test]
+    fn single_episode_has_no_end() {
+        let c = t("Breaking.Bad.S01E01.1080p", "Breaking Bad", &[]);
+        assert_eq!(c.episode, Some(1));
+        assert_eq!(c.episode_end, None);
     }
 }

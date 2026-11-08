@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ScanResult } from "../types";
 import { api } from "../api";

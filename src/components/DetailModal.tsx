@@ -1,7 +1,9 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Tag, VideoWithTags } from "../types";
 import { api } from "../api";
-import { Modal, RatingPicker, formatSize, toast } from "./ui";
+import { Modal, RatingPicker, episodeLabel, formatSize, toast } from "./ui";
+import { formatDuration } from "../lib/library";
+import { Icon } from "./icons";
 
 export function DetailModal({
   video,
@@ -21,20 +23,31 @@ export function DetailModal({
   const [progress, setProgress] = useState(video.watch_progress);
   const [videoTags, setVideoTags] = useState(video.tags ?? []);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const progressSavedRef = useRef(video.watch_progress);
+  const ratingSavedRef = useRef(video.rating);
 
   useEffect(() => {
     setTitle(video.title);
     setRating(video.rating);
     setProgress(video.watch_progress);
     setVideoTags(video.tags ?? []);
+    progressSavedRef.current = video.watch_progress;
+    ratingSavedRef.current = video.rating;
   }, [video]);
 
-  const saveProgress = async (p: number) => {
-    setProgress(p);
+  const clampProgress = (p: number) =>
+    Math.max(0, Math.min(100, Math.round(Number.isFinite(p) ? p : 0)));
+
+  const commitProgress = async (p: number) => {
+    const target = clampProgress(p);
+    setProgress(target);
+    if (target === progressSavedRef.current) return;
     try {
-      await api.updateProgress(video.id, p);
+      await api.updateProgress(video.id, target);
+      progressSavedRef.current = target;
       onChanged();
     } catch (e) {
+      setProgress(progressSavedRef.current);
       toast.err(String(e));
     }
   };
@@ -57,23 +70,31 @@ export function DetailModal({
   };
 
   const saveRating = async (r: number) => {
+    const previous = ratingSavedRef.current;
     setRating(r);
     try {
       await api.setRating(video.id, r);
+      ratingSavedRef.current = r;
       onChanged();
     } catch (e) {
+      setRating(previous);
       toast.err(String(e));
     }
   };
 
   const saveTitle = async () => {
     const t = title.trim();
-    if (!t || t === video.title) return;
+    if (!t) {
+      setTitle(video.title);
+      return;
+    }
+    if (t === video.title) return;
     try {
       await api.renameVideo(video.id, t);
       toast.ok("已改名");
       onChanged();
     } catch (e) {
+      setTitle(video.title);
       toast.err(String(e));
     }
   };
@@ -139,7 +160,7 @@ export function DetailModal({
           {video.kind === "movie" ? "电影" : video.kind === "series" ? "剧集" : "待定"}
           {video.series_name ? ` · ${video.series_name}` : ""}
           {video.season ? ` S${video.season}` : ""}
-          {video.episode ? `E${video.episode}` : ""}
+          {episodeLabel(video)}
         </span>
       </div>
       <div className="detail-row">
@@ -152,7 +173,7 @@ export function DetailModal({
         <label>大小</label>
         <span className="val">
           {formatSize(video.file_size)}
-          {video.duration ? ` · ${Math.round(video.duration / 60)} 分钟` : ""}
+          {video.duration ? ` · ${formatDuration(video.duration)}` : ""}
         </span>
       </div>
       <div className="detail-row">
@@ -161,42 +182,46 @@ export function DetailModal({
       </div>
       <div className="detail-row">
         <label>进度</label>
-        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 10 }}>
+        <div className="progress-editor">
           <input
             className="progress-slider"
             type="range"
             min={0}
             max={100}
-            step={5}
+            step={1}
             value={Math.round(progress)}
-            onChange={(e) => saveProgress(Number(e.target.value))}
+            aria-label="观看进度"
+            onChange={(e) => setProgress(clampProgress(Number(e.target.value)))}
+            onPointerUp={(e) => void commitProgress(Number(e.currentTarget.value))}
+            onKeyUp={(e) => void commitProgress(Number(e.currentTarget.value))}
           />
-          <span className="rating-num" style={{ minWidth: 42 }}>
-            {Math.round(progress)}%
-          </span>
-          <button className="progress-quick" onClick={() => saveProgress(0)}>
-            未看
-          </button>
-          <button className="progress-quick" onClick={() => saveProgress(50)}>
-            一半
-          </button>
-          <button className="progress-quick" onClick={() => saveProgress(100)}>
-            已看完
-          </button>
+          <span className="rating-num">{Math.round(progress)}%</span>
+          <div className="progress-quick-row">
+            <button type="button" className="progress-quick" onClick={() => void commitProgress(0)}>
+              未看
+            </button>
+            <button type="button" className="progress-quick" onClick={() => void commitProgress(50)}>
+              一半
+            </button>
+            <button type="button" className="progress-quick" onClick={() => void commitProgress(100)}>
+              已看完
+            </button>
+          </div>
         </div>
       </div>
       <div className="detail-row">
         <label>标签</label>
         <div className="tag-selector">
           {tags.map((t) => (
-            <span
+            <button
+              type="button"
               key={t.id}
               className={`tag-pick${attached.has(t.id) ? " on" : ""}`}
               onClick={() => toggleTag(t.id)}
             >
               <span className="tag-dot" style={{ background: t.color }} />
               {t.name}
-            </span>
+            </button>
           ))}
         </div>
       </div>
@@ -207,10 +232,7 @@ export function DetailModal({
             onPlay(video);
           }}
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "-2px", marginRight: 6 }}>
-            <circle cx="12" cy="12" r="8.8" />
-            <path d="M10.4 8.6l5 3.4-5 3.4z" />
-          </svg>
+          <Icon name="play" size={14} />
           播放
         </button>
         <button
@@ -223,20 +245,8 @@ export function DetailModal({
             }
           }}
         >
-          📁 所在文件夹
-        </button>
-        <button
-          className="btn btn-ghost"
-          onClick={async () => {
-            try {
-              await api.toggleFavorite(video.id);
-              onChanged();
-            } catch (e) {
-              toast.err(String(e));
-            }
-          }}
-        >
-          {video.is_favorite ? "★ 取消收藏" : "☆ 收藏"}
+          <Icon name="folder" size={14} />
+          所在文件夹
         </button>
       </div>
     </Modal>

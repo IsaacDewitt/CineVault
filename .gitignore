@@ -4,3 +4,6 @@ target
 *.local
 .DS_Store
 src-tauri/gen/schemas
+android/build
+android/keystore
+.workbuddy/
