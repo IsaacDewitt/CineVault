@@ -130,7 +130,7 @@ pub async fn refresh_video_thumbnail(
     result
 }
 
-/// `force = true` 走刷新分支，其余路径与常规加载完全一致（零行为变化）。
+/// `force = true` 走刷新分支（删旧图 + 随机落点），否则走常规加载（片长 20%）。
 async fn load_thumbnail(
     app: tauri::AppHandle,
     video_id: i64,
@@ -188,15 +188,24 @@ async fn load_thumbnail(
     let ffmpeg = ffmpeg.to_string();
     let source_for_task = source_path.clone();
     let target_for_task = target.clone();
-    // 常规加载固定 20%（保持原行为）；刷新改为随机落点。
-    let seek = if force {
-        random_seek(duration, video_id)
-    } else {
-        default_seek(duration)
-    };
+    // 库里时长为空/异常时现场探测真实片长，两条路径都受益——默认封面
+    // 也要按真实的 20% 落点，而不是盲抽第 5 秒。常规懒加载只走自研解析
+    // （allow_external=false，零子进程），刷新属低频操作才允许 ffprobe 兜底；
+    // 探测与抽帧一起放进 blocking 线程，不占 async runtime。
+    let need_probe = !duration.is_some_and(|d| d.is_finite() && d > 2.0);
 
     let generated = tauri::async_runtime::spawn_blocking(move || {
-        generate_thumbnail(&ffmpeg, &source_for_task, &target_for_task, seek)
+        let effective = if need_probe {
+            crate::media_info::probe_duration_sec(&source_for_task, force).or(duration)
+        } else {
+            duration
+        };
+        let seek = if force {
+            random_seek(effective, video_id)
+        } else {
+            default_seek(effective)
+        };
+        generate_thumbnail(&ffmpeg, &source_for_task, &target_for_task, seek, force)
     })
     .await
     .map_err(|e| format!("缩略图任务异常: {e}"))?;
@@ -209,16 +218,25 @@ async fn load_thumbnail(
 }
 
 /// 常规封面的抽帧位置：片长的 20%，无时长信息时退到第 5 秒。
+///
+/// **同样不能有 600 秒上限**（2026-11-08 修复）：电影普遍 100+ 分钟，
+/// `clamp(0.5, 600)` 会把 20% 硬砍成第 10 分钟，等于所有长片封面全长一个样。
+/// 0.2 × 片长恒小于片长，无需上限。
 fn default_seek(duration: Option<f64>) -> f64 {
     duration
         .filter(|d| d.is_finite() && *d > 0.0)
-        .map(|d| (d * 0.2).clamp(0.5, 600.0))
+        .map(|d| (d * 0.2).max(0.5))
         .unwrap_or(5.0)
 }
 
 /// 刷新用的随机抽帧位置。不引第三方 rand crate：刷新是低频人工操作，
 /// 用「纳秒时间 + video_id」经 xorshift 打散即可，完全离线且可审计。
 /// 比例落在 [0.10, 0.90)，刻意避开片头字幕与片尾名单这种千篇一律的画面。
+///
+/// **绝不能给这里加 600 秒上限**（2026-11-08 修复）：当时照抄了默认封面
+/// 的 `clamp(0.5, 600)`，片长一旦超过 50 分钟，随机的 d×ratio 就大面积
+/// 撞上 600 秒上限，全部坍缩成同一帧——表现即「刷新封面怎么点都是同一张图」。
+/// 按片长比例取值，天然不会越界。
 fn random_seek(duration: Option<f64>, video_id: i64) -> f64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -229,10 +247,11 @@ fn random_seek(duration: Option<f64>, video_id: i64) -> f64 {
     x ^= x >> 7;
     x ^= x << 17;
     let ratio = 0.10 + (x % 1000) as f64 / 1000.0 * 0.80;
-    match duration.filter(|d| d.is_finite() && *d > 1.0) {
-        Some(d) => (d * ratio).clamp(0.5, 600.0),
-        // 时长未知时在 5~50 秒里随机落点；超出片长会由 generate_thumbnail
-        // 回退到 0 秒重试，不会留下空缓存。
+    match duration.filter(|d| d.is_finite() && *d > 2.0) {
+        // ratio < 0.90 ⇒ 结果恒小于片长，无需 clamp 上限。
+        Some(d) => (d * ratio).max(0.5),
+        // 时长探测也拿不到时，在 10~50 秒里随机落点；越过片长会由
+        // generate_thumbnail 分级退让，不会每次都跌回 0 秒那张恒定画面。
         None => 5.0 + ratio * 50.0,
     }
 }
@@ -281,12 +300,23 @@ fn read_data_url(path: &Path) -> Result<String, String> {
     Ok(format!("data:image/jpeg;base64,{}", base64_encode(&bytes)))
 }
 
-fn generate_thumbnail(ffmpeg: &str, source: &Path, target: &Path, seek: f64) -> bool {
+fn generate_thumbnail(
+    ffmpeg: &str,
+    source: &Path,
+    target: &Path,
+    seek: f64,
+    force: bool,
+) -> bool {
     if extract_once(ffmpeg, source, target, seek) {
         return true;
     }
+    // 刷新专属兜底：DB 时长偏大或随机落点越过片长时，先退到一半的位置
+    // （每次仍不同），避免直接跌到 0 秒那张恒定片头帧。常规加载路径不进这里，
+    // 保持原有的「一次失败 → 回片头」行为不变。
+    if force && seek > 1.0 && extract_once(ffmpeg, source, target, seek * 0.5) {
+        return true;
+    }
     // 有些文件关键帧/时长元数据异常，指定位置抓不到帧；回到开头再试一次。
-    // 刷新时随机落点可能越过实际片长，这条兜底同样能保底出图。
     seek > 0.6 && extract_once(ffmpeg, source, target, 0.0)
 }
 
@@ -393,6 +423,39 @@ mod tests {
         }
     }
 
+    /// 回归：2026-11-08 报障「刷新封面怎么点都是同一张图」。
+    /// 当时 random_seek 把 d×ratio 也 clamp 到 600 秒，2 小时以上的片子
+    /// 所有落点全变成 600.0，连默认封面也是 600 秒，刷新前后自然一模一样。
+    #[test]
+    fn random_seek_varies_for_long_videos() {
+        let seeks: Vec<f64> = (0..32)
+            .map(|id| random_seek(Some(8700.7), id))
+            .collect();
+        for (id, s) in seeks.iter().enumerate() {
+            assert!(
+                *s > 600.0 && *s < 8700.7,
+                "长片落点不能撞 600 秒上限: id={id} seek={s}"
+            );
+        }
+        let min = seeks.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = seeks.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            max - min > 3000.0,
+            "32 次刷新的落点应铺开在大部分片长上，实际 {min:.1}..{max:.1}"
+        );
+    }
+
+    /// 回归：默认封面也被同一个 600 秒上限砍过，2 小时片一律抽第 10 分钟。
+    #[test]
+    fn default_seek_uses_full_runtime() {
+        let d = 8700.7;
+        let s = default_seek(Some(d));
+        assert!((s - d * 0.2).abs() < 1e-6, "应落在片长 20%: {s}");
+        assert!(s > 600.0, "2 小时片不能还抽第 10 分钟");
+        assert_eq!(default_seek(Some(100.0)), 20.0);
+        assert_eq!(default_seek(None), 5.0);
+    }
+
     #[test]
     fn base64_matches_known_vectors() {
         assert_eq!(base64_encode(b""), "");
@@ -429,7 +492,7 @@ mod tests {
                 "-i",
                 "testsrc=size=320x180:rate=24",
                 "-t",
-                "2",
+                "12",
                 "-pix_fmt",
                 "yuv420p",
                 "-y",
@@ -447,12 +510,22 @@ mod tests {
         }
 
         assert!(
-            generate_thumbnail(ffmpeg, &source, &target, 0.4),
+            generate_thumbnail(ffmpeg, &source, &target, 0.4, false),
             "ffmpeg 应能为测试视频生成缩略图"
         );
         assert!(target.metadata().map(|m| m.len() > 0).unwrap_or(false));
         let bytes = std::fs::read(&target).unwrap();
         assert_eq!(&bytes[..2], [0xFF, 0xD8], "输出应是 JPEG");
+
+        // 端到端印证「换落点 = 换画面」：合成片画面逐帧变化，
+        // 两个相距很远的 -ss 必须抽出不同的 JPEG。
+        let other = dir.join("thumb2.jpg");
+        assert!(generate_thumbnail(ffmpeg, &source, &other, 9.0, false));
+        assert_ne!(
+            bytes,
+            std::fs::read(&other).unwrap(),
+            "不同抽帧位置不能得到同一张图"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
